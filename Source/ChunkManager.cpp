@@ -1,5 +1,6 @@
 #include "ChunkManager.h"
 #include "ChunkMeshBuilder.h"
+#include "VoronoiMeshBuilder.h"
 #include "PerlinNoise.hpp"
 #include "renderer/backend/ProgramManager.h"
 #include "renderer/backend/ProgramState.h"
@@ -403,15 +404,32 @@ ax::Node* ChunkManager::buildChunkVisualNode(const ChunkKey& key, ChunkData& dat
     neighborZ1 = getNeighborData(0, 1);
 
     // Мешбилдинг
-    std::vector<ChunkVertex> verts;
     // Используем ax::IndexArray вместо std::vector<uint16_t>
     // для совместимости с Mesh::create(const IndexArray& indices).
     // Конструктор по умолчанию IndexArray() инициализирует stride=2 (U_SHORT).
     ax::IndexArray inds;
-    buildChunkMesh(data, neighborX0, neighborX1, neighborZ0, neighborZ1, verts, inds);
-    if (verts.empty())
-        return nullptr;
-    ax::Mesh* mesh = createMesh(verts, inds, _terrainAtlas);
+    ax::Mesh* mesh = nullptr;
+    if (_cfg.voronoiTerrain)
+    {
+        // Воронои-меш легко переваливает за 65535 вершин → 32-битные индексы.
+        inds = ax::IndexArray(ax::backend::IndexFormat::U_INT);
+        std::vector<voronoi::Vertex> vverts;
+        if (!voronoi::buildChunkMesh(key, _cfg.voronoiSeed, data, neighborX0, neighborX1, neighborZ0, neighborZ1,
+                                     vverts, inds))
+            AXLOGW("ChunkManager: voronoi mesh truncated at %zu vertices (chunk %d,%d,%d)", vverts.size(), key.x,
+                   key.y, key.z);
+        if (vverts.empty())
+            return nullptr;
+        mesh = voronoi::createMesh(vverts, inds, _terrainAtlas);
+    }
+    else
+    {
+        std::vector<ChunkVertex> verts;
+        buildChunkMesh(data, neighborX0, neighborX1, neighborZ0, neighborZ1, verts, inds);
+        if (verts.empty())
+            return nullptr;
+        mesh = createMesh(verts, inds, _terrainAtlas);
+    }
     if (!mesh)
         return nullptr;
 
@@ -435,10 +453,15 @@ ax::Node* ChunkManager::buildChunkVisualNode(const ChunkKey& key, ChunkData& dat
     // UNLIT-материала, который несёт render-state и привязку атласа). Программа
     // кэшируется ProgramManager, поэтому вызов на каждый чанк дёшев. Если шейдер
     // не собран (program == nullptr) — остаётся обычный UNLIT.
-    if (_cfg.pixelArtAA)
+    // Воронои-террейну всегда нужен свой шейдер (освещение по нормали), независимо от pixelArtAA.
+    if (_cfg.voronoiTerrain || _cfg.pixelArtAA)
     {
-        auto* program = ax::ProgramManager::getInstance()->loadProgram("custom/terrain_vs", "custom/terrain_fs",
-                                                                       ax::backend::VertexLayoutType::Unspec);
+        auto* program = _cfg.voronoiTerrain
+                            ? ax::ProgramManager::getInstance()->loadProgram(
+                                  "custom/voronoi_terrain_vs", "custom/voronoi_terrain_fs",
+                                  ax::backend::VertexLayoutType::Unspec)
+                            : ax::ProgramManager::getInstance()->loadProgram("custom/terrain_vs", "custom/terrain_fs",
+                                                                             ax::backend::VertexLayoutType::Unspec);
         if (program)
         {
             auto* ps = new ax::backend::ProgramState(program);
