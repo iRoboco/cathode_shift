@@ -25,7 +25,7 @@
 
 cmake_minimum_required(VERSION 3.22...4.1)
 
-set(APP_NAME 3d-adventure_next)
+set(APP_NAME cathode_shift)
 
 project(${APP_NAME})
 
