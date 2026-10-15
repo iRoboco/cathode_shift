@@ -25,6 +25,7 @@
 
 #pragma once
 #include "axmol.h"
+#include "Biome.h"
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -293,13 +294,15 @@ public:
         /// При false — обычный встроенный UNLIT + режим из textureFilter.
         bool pixelArtAA = false;
 
-        /// @brief Террейн из ячеек Вороного (Voro++) вместо кубов (см. VoronoiMeshBuilder.h).
-        /// Геометрия считается из сидов (хэш мировых координат + voronoiSeed) — в сейве
-        /// хранится только тип блока. Вода остаётся кубической. Коллизии/рейкаст пока по сетке.
+        /// @brief Биом-зависимый террейн (см. Biome.h, VoronoiMeshBuilder.h): кубы / ячейки Вороного /
+        /// «желе» в одном мире. false → прежние кубы старым билдером (UNLIT, без нормалей).
+        /// Геометрия считается из координат (биомы и сиды — чистые функции) — в сейве хранится
+        /// только тип блока. Вода остаётся кубической. Коллизии/рейкаст пока по сетке.
         bool voronoiTerrain = true;
 
-        /// @brief Сид джиттера Вороного. Привяжите к сиду мира, чтобы геометрия была воспроизводимой.
-        uint32_t voronoiSeed = 1337u;
+        /// @brief Биомы: размер областей, ширина смешивания, частоты типов, сид мира.
+        /// Привяжите biomes.seed к сиду мира. enabled=false → весь мир одного типа biomes.forced.
+        biome::BiomeConfig biomes{};
 
         /// @brief Сборка мешей террейна в фоновых воркерах (общая очередь с генерацией).
         /// false → прежнее поведение: меш строится синхронно в главном потоке.
@@ -536,6 +539,15 @@ public:
      *       без race conditions с генерацией/выгрузкой.
      */
     BlockId getBlockAtWorldPos(const ax::Vec3& worldPos) const;
+
+    /**
+     * @brief Биом в мировой точке: веса типов, curvature, softness (чистая функция конфига).
+     * @note Для генератора мира (тип биома → блоки/высоты), HUD и отладки. Потокобезопасно.
+     */
+    biome::BiomeSample sampleBiome(const ax::Vec3& worldPos) const
+    {
+        return biome::sample(_cfg.biomes, worldPos.x, worldPos.z);
+    }
 
     /**
      * @brief Конвертация координат чанка в мировые координаты (нижний угол)

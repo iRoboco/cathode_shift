@@ -1,5 +1,6 @@
 #pragma once
 #include "axmol.h"
+#include "Biome.h"
 #include "ChunkManager.h"
 #include "ChunkMeshBuilder.h"  // calculateTileUV, getBlockTileIndex
 #include "cell.hh"             // Voro++: voro::voronoicell_neighbor
@@ -11,40 +12,45 @@
 
 /**
  * @file VoronoiMeshBuilder.h
- * @brief Меш террейна из ячеек Вороного (Voro++) вместо кубов.
+ * @brief Биом-зависимый меш террейна: кубы, ячейки Вороного, «желе» — в одном чанке.
  *
- * Идея: каждый блок сетки владеет одним сидом = центр блока + детерминированный джиттер
- * (хэш от МИРОВЫХ координат блока и worldSeed). Ячейка блока — выпуклый многогранник,
- * вырезанный полуплоскостями до сидов соседей в окне 5x5x5. Для хранения нужен только
- * тип блока (как и раньше): сиды и геометрия вычисляются на лету, поэтому швов между
- * чанками нет — соседний чанк даёт те же сиды.
+ * Геометрия каждого блока — ячейка Вороного его сида. Сид = центр блока + детерминированный
+ * джиттер × curvature(биом в колонке блока):
+ *   • curvature = 0  → сид ровно в центре → ячейка = ТОЧНЫЙ куб (диаграмма Вороного кубической
+ *     решётки — это сама решётка). Это и есть «кривизна спадает на нет» у границы с классическим
+ *     биомом: поле curvature непрерывно, значит сиды смещаются непрерывно, швов нет.
+ *   • Если у блока и всех его соседей по кольцу 1 curvature == 0 (точное равенство, см. Biome.h),
+ *     ячейка — гарантированно куб, и вместо клиппинга Voro++ берётся дешёвый путь из 6 квадов.
+ *   • softness > 0 (желейный биом) → к вершинам применяется поле смещений D(p), непрерывное по
+ *     позиции: общие вершины соседних ячеек смещаются одинаково → трещин нет.
  *
- * Строятся только приповерхностные ячейки: твёрдый блок, у которого в окне 3x3x3 есть
- * воздух/вода. Внутренность массива не трогается (в типичном чанке это ~1-3 тыс. ячеек
- * вместо ~20 тыс. твёрдых блоков).
- *
- * Грань ячейки рисуется, если блок-сосед за ней (id плоскости = смещение соседа) не твёрдый.
- * Вода/воздух — «не твёрдые», как и в buildChunkMesh().
+ * Ячейки строятся только для приповерхностных блоков (твёрдый блок с воздухом/водой в окне 3×3×3).
+ * Грань рисуется, если блок за ней не твёрдый. Вода/воздух — «не твёрдые».
  */
 namespace voronoi
 {
 
-/// Макс. смещение сида от центра блока (в блоках). Должно быть < 0.5; чем меньше, тем реже
-/// в ячейку попадают соседи дальше 1-го кольца (см. kExposureRing).
+/// Макс. смещение сида от центра блока (в блоках) при curvature = 1. Должно быть < 0.5.
 constexpr double kJitter = 0.30;
 
 /// Радиус окна соседей, чьи сиды режут ячейку (2 → 5x5x5 = 124 кандидата).
 constexpr int kRing = 2;
 
-/// Масштаб планарной проекции UV (тайлов на блок) и отступ от края тайла (защита от bleed).
-constexpr float kUvScale = 0.8f;
-constexpr float kUvInset = 0.02f;
+/// UV: масштаб планарной проекции (тайлов на блок) и отступ от края тайла (защита от bleed).
+constexpr float kVoronoiUvScale = 0.8f;
+constexpr float kVoronoiUvInset = 0.02f;
+constexpr float kCubeUvScale    = 1.0f;
+constexpr float kCubeUvInset    = 0.002f;
 
-/// Страховочный лимит вершин на меш. Индексы 32-битные (IndexFormat::U_INT), поэтому реальный
-/// чанк в него не упирается; лимит защищает только от патологических данных.
+/// Желе: вынос поверхности по нормали и провисание под нагрузкой (в блоках), кап нагрузки (блоков сверху).
+constexpr float kJellyBulge   = 0.16f;
+constexpr float kJellySag     = 0.12f;
+constexpr int   kJellyLoadCap = 12;
+
+/// Страховочный лимит вершин на меш (индексы 32-битные).
 constexpr size_t kMaxVertices = 4000000;
 
-/// Вершина воронои-меша: позиция, UV атласа, нормаль грани (flat shading).
+/// Вершина: позиция, UV атласа, нормаль грани (flat shading).
 struct Vertex
 {
     float x, y, z;
@@ -57,8 +63,7 @@ struct Offset
     int dx, dy, dz;
 };
 
-/// Смещения соседей окна 5x5x5 (без нуля), отсортированы по расстоянию — ближние режут первыми,
-/// поэтому дальние кандидаты почти всегда отбрасываются проверкой радиуса.
+/// Смещения соседей окна 5x5x5 (без нуля), по возрастанию расстояния.
 inline const std::vector<Offset>& neighborOffsets()
 {
     static const std::vector<Offset> offsets = [] {
@@ -86,41 +91,42 @@ inline uint64_t mix64(uint64_t x)
     return x;
 }
 
-/// Детерминированный джиттер сида блока (мировые координаты) в [-kJitter, +kJitter] по каждой оси.
-inline void seedJitter(uint32_t worldSeed, int gx, int gy, int gz, double& jx, double& jy, double& jz)
+/// Единичный джиттер сида блока (мировые координаты), каждая компонента в [-1, 1].
+inline void seedJitterUnit(uint32_t seed, int gx, int gy, int gz, double& jx, double& jy, double& jz)
 {
     uint64_t h = mix64(static_cast<uint64_t>(static_cast<uint32_t>(gx)) * 0x9E3779B185EBCA87ULL ^
                        static_cast<uint64_t>(static_cast<uint32_t>(gy)) * 0xC2B2AE3D27D4EB4FULL ^
-                       static_cast<uint64_t>(static_cast<uint32_t>(gz)) * 0x165667B19E3779F9ULL ^ worldSeed);
-    auto f = [&](int shift) { return (static_cast<double>((h >> shift) & 0xFFFFF) / 1048575.0 - 0.5) * 2.0 * kJitter; };
+                       static_cast<uint64_t>(static_cast<uint32_t>(gz)) * 0x165667B19E3779F9ULL ^ seed);
+    auto f = [&](int shift) { return static_cast<double>((h >> shift) & 0xFFFFF) / 1048575.0 * 2.0 - 1.0; };
     jx = f(0);
     jy = f(20);
     jz = f(40);
 }
 
 /**
- * @brief Строит воронои-меш чанка.
+ * @brief Строит биом-зависимый меш чанка.
  *
- * @param key        Ключ чанка (нужен для МИРОВЫХ координат сидов).
- * @param worldSeed  Сид мира для джиттера (одинаковый сид → одинаковая геометрия).
- * @param data       Блоки чанка.
- * @param neighborX0/X1/Z0/Z1 Соседние чанки (nullptr = не загружен → считается воздухом).
- *                   Диагональные чанки не передаются и считаются воздухом: максимум это даст
- *                   лишние (невидимые внутри массива) грани в 4 угловых колонках.
- * @param vertices   Выход: вершины (локальные координаты чанка, как у buildChunkMesh).
- * @param indices    Выход: индексы. ОБЯЗАТЕЛЬНО ax::IndexArray(ax::backend::IndexFormat::U_INT)
- *                   (emplace_back<uint32_t> в Axmol 2.x ассертит совпадение stride).
+ * @param key     Ключ чанка (мировые координаты сидов и биомов).
+ * @param biomes  Конфиг биомов (+ сид мира). Чистые функции: одинаковый конфиг → одинаковая геометрия.
+ * @param data    Блоки чанка.
+ * @param neighborX0/X1/Z0/Z1 Соседние чанки (nullptr = не загружен → воздух). Диагональные чанки
+ *                считаются воздухом (максимум — лишние невидимые грани в 4 угловых колонках).
+ * @param vertices Выход: вершины (локальные координаты чанка).
+ * @param indices  Выход: ОБЯЗАТЕЛЬНО ax::IndexArray(ax::backend::IndexFormat::U_INT).
+ * @param allowCubePath false → кубический быстрый путь отключён, все ячейки идут через клиппинг Voro++
+ *                      (для тестов/отладки: результат обязан совпасть с гибридным).
  * @return false, если упёрлись в kMaxVertices (меш усечён).
  */
 inline bool buildChunkMesh(const ChunkKey& key,
-                           uint32_t worldSeed,
+                           const biome::BiomeConfig& biomes,
                            const ChunkData& data,
                            const ChunkData* neighborX0,
                            const ChunkData* neighborX1,
                            const ChunkData* neighborZ0,
                            const ChunkData* neighborZ1,
                            std::vector<Vertex>& vertices,
-                           ax::IndexArray& indices)
+                           ax::IndexArray& indices,
+                           bool allowCubePath = true)
 {
     constexpr int CX = CHUNK_SIZE_X;
     constexpr int CY = CHUNK_SIZE_Y;
@@ -167,7 +173,7 @@ inline bool buildChunkMesh(const ChunkKey& key,
     // ---- 2. «Внутренность»: все 27 блоков окна твёрдые (сепарабельная эрозия) ----
     std::vector<uint8_t> tmp(N), interior(N);
     auto erode = [&](const std::vector<uint8_t>& src, std::vector<uint8_t>& dst, int axis) {
-        const int lim = axis == 0 ? PX : (axis == 1 ? PZ : PY);
+        const int lim       = axis == 0 ? PX : (axis == 1 ? PZ : PY);
         const size_t stride = axis == 0 ? static_cast<size_t>(PY) : (axis == 1 ? static_cast<size_t>(PX) * PY : 1);
         for (int pz = 0; pz < PZ; ++pz)
             for (int px = 0; px < PX; ++px)
@@ -175,7 +181,7 @@ inline bool buildChunkMesh(const ChunkKey& key,
                 {
                     const size_t i = idx(px, pz, py);
                     const int c    = axis == 0 ? px : (axis == 1 ? pz : py);
-                    dst[i] = (c >= 1 && c < lim - 1) ? (src[i - stride] & src[i] & src[i + stride]) : 0;
+                    dst[i]         = (c >= 1 && c < lim - 1) ? (src[i - stride] & src[i] & src[i + stride]) : 0;
                 }
     };
     erode(solid, tmp, 0);
@@ -183,28 +189,271 @@ inline bool buildChunkMesh(const ChunkKey& key,
     erode(interior, tmp, 2);
     interior.swap(tmp);
 
-    // ---- 2b. Таблица джиттера на всю паддинг-область (хэш каждого блока считаем 1 раз, а не ~124) ----
+    // ---- 3. Биомы по колонкам паддинга: curvature / softness (чистая функция мировых координат) ----
     const int baseGX = key.x * CX, baseGY = key.y * CY, baseGZ = key.z * CZ;
-    std::vector<double> jit(N * 3);
+    const size_t NC  = static_cast<size_t>(PX) * PZ;
+    std::vector<float> kap(NC), soft(NC);
+    bool anySoft = false;
     for (int pz = 0; pz < PZ; ++pz)
         for (int px = 0; px < PX; ++px)
+        {
+            const auto s = biome::sample(biomes, baseGX + (px - R) + 0.5, baseGZ + (pz - R) + 0.5);
+            kap[static_cast<size_t>(pz) * PX + px]  = s.curvature;
+            soft[static_cast<size_t>(pz) * PX + px] = s.softness;
+            anySoft |= s.softness > 0.0f;
+        }
+    // Колонка «чисто кубическая»: curvature == 0 у неё и у всех 8 соседних колонок (кольцо 1).
+    // Тогда все шесть граней ячейки — плоскости x/y/z = ±0.5, а диагональные соседи куб не режут.
+    std::vector<uint8_t> pureCol(NC, 0);
+    for (int pz = 1; pz < PZ - 1; ++pz)
+        for (int px = 1; px < PX - 1; ++px)
+        {
+            bool pure = true;
+            for (int dz = -1; dz <= 1 && pure; ++dz)
+                for (int dx = -1; dx <= 1; ++dx)
+                    if (kap[static_cast<size_t>(pz + dz) * PX + (px + dx)] != 0.0f)
+                    {
+                        pure = false;
+                        break;
+                    }
+            pureCol[static_cast<size_t>(pz) * PX + px] = pure ? 1 : 0;
+        }
+
+    // ---- 4. Таблица джиттера сидов (амплитуда = kJitter · curvature колонки; 0 → без хэша) ----
+    std::vector<double> jit(N * 3, 0.0);
+    for (int pz = 0; pz < PZ; ++pz)
+        for (int px = 0; px < PX; ++px)
+        {
+            const float k = kap[static_cast<size_t>(pz) * PX + px];
+            if (k == 0.0f)
+                continue;
+            const double amp = kJitter * k;
             for (int py = 0; py < PY; ++py)
             {
+                double ux, uy, uz;
+                seedJitterUnit(biomes.seed, baseGX + px - R, baseGY + py - R, baseGZ + pz - R, ux, uy, uz);
                 double* j = &jit[idx(px, pz, py) * 3];
-                seedJitter(worldSeed, baseGX + px - R, baseGY + py - R, baseGZ + pz - R, j[0], j[1], j[2]);
+                j[0]      = ux * amp;
+                j[1]      = uy * amp;
+                j[2]      = uz * amp;
             }
+        }
 
-    // ---- 3. Ячейки приповерхностных блоков ----
+    // ---- 5. Желе: поле смещений узлов решётки (лениво, только если в чанке есть softness > 0) ----
+    // Узел (a,b,c) — угол блоков (a-1..a, b-1..b, c-1..c) паддинга; в локальных координатах чанка
+    // он лежит в (a-R, b-R, c-R). D — функция ТОЛЬКО позиции → общие вершины смещаются одинаково.
+    std::vector<uint8_t> over;       // нагрузка: сколько твёрдых блоков НАД ячейкой в колонке (кап)
+    std::vector<float> nodeD;        // 3 float на узел
+    std::vector<uint8_t> nodeReady;
+    const int NA = PX + 1, NC2 = PZ + 1, NB = PY + 1;
+    auto nidx = [&](int a, int b, int c) { return (static_cast<size_t>(c) * NA + a) * NB + b; };
+    if (anySoft)
+    {
+        over.assign(N, 0);
+        for (int pz = 0; pz < PZ; ++pz)
+            for (int px = 0; px < PX; ++px)
+            {
+                int cnt = 0;
+                for (int py = PY - 1; py >= 0; --py)
+                {
+                    over[idx(px, pz, py)] = static_cast<uint8_t>(std::min(cnt, kJellyLoadCap));
+                    cnt += solid[idx(px, pz, py)];
+                }
+            }
+        nodeD.assign(static_cast<size_t>(NA) * NC2 * NB * 3, 0.0f);
+        nodeReady.assign(static_cast<size_t>(NA) * NC2 * NB, 0);
+    }
+    auto nodeDisp = [&](int a, int b, int c) -> const float* {
+        a = std::clamp(a, 1, PX - 1);
+        b = std::clamp(b, 1, PY - 1);
+        c = std::clamp(c, 1, PZ - 1);
+        const size_t ni = nidx(a, b, c);
+        float* d        = &nodeD[ni * 3];
+        if (nodeReady[ni])
+            return d;
+        nodeReady[ni] = 1;
+
+        // 8 блоков вокруг узла: доля твёрдых, градиент твёрдости, средняя нагрузка
+        int sum = 0, gx = 0, gy = 0, gz = 0, ov = 0;
+        for (int dz = 0; dz <= 1; ++dz)
+            for (int dy = 0; dy <= 1; ++dy)
+                for (int dx = 0; dx <= 1; ++dx)
+                {
+                    const size_t bi = idx(a - 1 + dx, c - 1 + dz, b - 1 + dy);
+                    const int s     = solid[bi];
+                    sum += s;
+                    gx += s * (dx ? 1 : -1);
+                    gy += s * (dy ? 1 : -1);
+                    gz += s * (dz ? 1 : -1);
+                    ov += over[bi];
+                }
+        const float air  = 1.0f - static_cast<float>(sum) / 8.0f;
+        const float surf = 4.0f * air * (1.0f - air);  // 1 на поверхности, 0 в массиве и в воздухе
+        if (surf <= 0.0f)
+            return d;
+        const float load = static_cast<float>(ov) / (8.0f * kJellyLoadCap);
+        // Мягкость в углу узла: биом по мировым координатам узла (чистая функция позиции)
+        const float sft = biome::sample(biomes, baseGX + (a - R), baseGZ + (c - R)).softness;
+        if (sft <= 0.0f)
+            return d;
+        // g смотрит в сторону твёрдого → «наружу» это −g. Вынос растёт с нагрузкой; провисание — вниз.
+        const float k = sft * surf;
+        d[0]          = -static_cast<float>(gx) * 0.25f * kJellyBulge * (0.5f + 0.5f * load) * k;
+        d[1]          = (-static_cast<float>(gy) * 0.25f * kJellyBulge * (0.5f + 0.5f * load) - kJellySag * load) * k;
+        d[2]          = -static_cast<float>(gz) * 0.25f * kJellyBulge * (0.5f + 0.5f * load) * k;
+        return d;
+    };
+    // Трилинейная интерполяция поля смещений в локальной точке чанка p.
+    auto displace = [&](double& x, double& y, double& z) {
+        const double qx = x + R, qy = y + R, qz = z + R;  // координаты в пространстве узлов паддинга
+        const int a = static_cast<int>(std::floor(qx)), b = static_cast<int>(std::floor(qy)),
+                  c      = static_cast<int>(std::floor(qz));
+        const double fx = qx - a, fy = qy - b, fz = qz - c;
+        double dx = 0, dy = 0, dz = 0;
+        for (int k = 0; k <= 1; ++k)
+            for (int j = 0; j <= 1; ++j)
+                for (int i = 0; i <= 1; ++i)
+                {
+                    const double w = (i ? fx : 1 - fx) * (j ? fy : 1 - fy) * (k ? fz : 1 - fz);
+                    if (w <= 0.0)
+                        continue;
+                    const float* d = nodeDisp(a + i, b + j, c + k);
+                    dx += w * d[0];
+                    dy += w * d[1];
+                    dz += w * d[2];
+                }
+        x += dx;
+        y += dy;
+        z += dz;
+    };
+
+    // ---- 6. Эмиссия одной грани (общая для кубического и воронои-пути) ----
+    bool truncated = false;
+    auto emitFace  = [&](BlockId bid, double* px, double* py, double* pz, int n, float fnx, float fny, float fnz,
+                         bool cubePath) {
+        if (vertices.size() + static_cast<size_t>(n) > kMaxVertices)
+        {
+            truncated = true;
+            return;
+        }
+        // Обход CCW снаружи: проверяем по Ньюэллу против номинальной нормали, при необходимости разворачиваем.
+        double ax_ = 0, ay_ = 0, az_ = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            const int j = (i + 1) % n;
+            ax_ += (py[i] - py[j]) * (pz[i] + pz[j]);
+            ay_ += (pz[i] - pz[j]) * (px[i] + px[j]);
+            az_ += (px[i] - px[j]) * (py[i] + py[j]);
+        }
+        if (ax_ * fnx + ay_ * fny + az_ * fnz < 0.0)
+        {
+            std::reverse(px, px + n);
+            std::reverse(py, py + n);
+            std::reverse(pz, pz + n);
+        }
+
+        // Тайл по номинальной нормали: верх / низ / бок.
+        const int kind = fny > 0.5f ? 2 : (fny < -0.5f ? 3 : 0);
+        const auto tuv = calculateTileUV(getBlockTileIndex(bid, kind));
+        const float uvScale = cubePath ? kCubeUvScale : kVoronoiUvScale;
+        const float uvInset = cubePath ? kCubeUvInset : kVoronoiUvInset;
+
+        // UV — по НЕсмещённой геометрии: текстура «прилипает» к блоку и деформируется вместе с ним.
+        double cx = 0, cy = 0, cz = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            cx += px[i];
+            cy += py[i];
+            cz += pz[i];
+        }
+        cx /= n;
+        cy /= n;
+        cz /= n;
+        double t1x, t1y, t1z, t2x, t2y, t2z;
+        if (kind != 0)
+        {  // верх/низ: u ← x, v ← z
+            t1x = 1; t1y = 0; t1z = 0;
+            t2x = 0; t2y = 0; t2z = 1;
+        }
+        else
+        {  // бок: u ← up × n (вправо при взгляде снаружи), v ← y
+            double hx = fnz, hz = -fnx;
+            const double hl = std::sqrt(hx * hx + hz * hz);
+            hx = hl > 1e-6 ? hx / hl : 1.0;
+            hz = hl > 1e-6 ? hz / hl : 0.0;
+            t1x = hx; t1y = 0; t1z = hz;
+            t2x = 0; t2y = 1; t2z = 0;
+        }
+        float U[16], V[16];
+        const int m = std::min(n, 16);
+        for (int i = 0; i < m; ++i)
+        {
+            const double dx = px[i] - cx, dy = py[i] - cy, dz = pz[i] - cz;
+            float u = 0.5f + static_cast<float>(dx * t1x + dy * t1y + dz * t1z) * uvScale;
+            float v = 0.5f + static_cast<float>(dx * t2x + dy * t2y + dz * t2z) * uvScale;
+            u       = std::clamp(u, uvInset, 1.0f - uvInset);
+            v       = std::clamp(v, uvInset, 1.0f - uvInset);
+            U[i]    = tuv[0] + u * (tuv[2] - tuv[0]);
+            V[i]    = tuv[1] + v * (tuv[3] - tuv[1]);
+        }
+
+        // Желейная деформация вершин (непрерывное поле по позиции).
+        if (anySoft)
+            for (int i = 0; i < m; ++i)
+                displace(px[i], py[i], pz[i]);
+
+        // Нормаль грани: по итоговому (возможно смещённому) полигону; запасной вариант — номинальная.
+        double nnx = 0, nny = 0, nnz = 0;
+        for (int i = 0; i < m; ++i)
+        {
+            const int j = (i + 1) % m;
+            nnx += (py[i] - py[j]) * (pz[i] + pz[j]);
+            nny += (pz[i] - pz[j]) * (px[i] + px[j]);
+            nnz += (px[i] - px[j]) * (py[i] + py[j]);
+        }
+        const double nl = std::sqrt(nnx * nnx + nny * nny + nnz * nnz);
+        float ox = fnx, oy = fny, oz = fnz;
+        if (nl > 1e-9)
+        {
+            ox = static_cast<float>(nnx / nl);
+            oy = static_cast<float>(nny / nl);
+            oz = static_cast<float>(nnz / nl);
+        }
+
+        const uint32_t base = static_cast<uint32_t>(vertices.size());
+        for (int i = 0; i < m; ++i)
+            vertices.push_back({static_cast<float>(px[i]), static_cast<float>(py[i]), static_cast<float>(pz[i]), U[i],
+                                V[i], ox, oy, oz});
+        for (int i = 1; i + 1 < m; ++i)  // веер (грань выпуклая)
+        {
+            indices.emplace_back<uint32_t>(base);
+            indices.emplace_back<uint32_t>(base + static_cast<uint32_t>(i));
+            indices.emplace_back<uint32_t>(base + static_cast<uint32_t>(i) + 1u);
+        }
+    };
+
+    // ---- 7. Ячейки приповерхностных блоков ----
+    static const int kCube[6][4][3] = {
+        {{1, 0, 0}, {1, 1, 0}, {1, 1, 1}, {1, 0, 1}},  // +X
+        {{0, 0, 1}, {0, 1, 1}, {0, 1, 0}, {0, 0, 0}},  // -X
+        {{0, 1, 0}, {0, 1, 1}, {1, 1, 1}, {1, 1, 0}},  // +Y
+        {{0, 0, 0}, {1, 0, 0}, {1, 0, 1}, {0, 0, 1}},  // -Y
+        {{1, 0, 1}, {1, 1, 1}, {0, 1, 1}, {0, 0, 1}},  // +Z
+        {{0, 0, 0}, {0, 1, 0}, {1, 1, 0}, {1, 0, 0}},  // -Z
+    };
+    static const int kDir[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+
     const auto& offsets = neighborOffsets();
     voro::voronoicell_neighbor cell;
     std::vector<double> vs, nm;
     std::vector<int> fv, nb;
 
-    bool truncated = false;
-
     for (int z = 0; z < CZ && !truncated; ++z)
         for (int x = 0; x < CX && !truncated; ++x)
-            for (int y = 0; y <= yMax; ++y)
+        {
+            const size_t col = static_cast<size_t>(z + R) * PX + (x + R);
+            const bool pure  = allowCubePath && pureCol[col] != 0;
+            for (int y = 0; y <= yMax && !truncated; ++y)
             {
                 const BlockId bid = data.getBlock(x, y, z);
                 if (bid == BLOCK_AIR || bid == BLOCK_WATER)
@@ -212,6 +461,27 @@ inline bool buildChunkMesh(const ChunkKey& key,
                 if (interior[idx(x + R, z + R, y + R)])
                     continue;
 
+                if (pure)
+                {
+                    // --- Кубический путь: 6 квадов, видимые, если сосед не твёрдый ---
+                    for (int f = 0; f < 6; ++f)
+                    {
+                        if (solid[idx(x + kDir[f][0] + R, z + kDir[f][2] + R, y + kDir[f][1] + R)])
+                            continue;
+                        double px[4], py[4], pz[4];
+                        for (int i = 0; i < 4; ++i)
+                        {
+                            px[i] = x + kCube[f][i][0];
+                            py[i] = y + kCube[f][i][1];
+                            pz[i] = z + kCube[f][i][2];
+                        }
+                        emitFace(bid, px, py, pz, 4, static_cast<float>(kDir[f][0]), static_cast<float>(kDir[f][1]),
+                                 static_cast<float>(kDir[f][2]), true);
+                    }
+                    continue;
+                }
+
+                // --- Путь Вороного: ячейка клиппингом полуплоскостей до сидов соседей ---
                 const double* j0 = &jit[idx(x + R, z + R, y + R) * 3];
                 const double j0x = j0[0], j0y = j0[1], j0z = j0[2];
 
@@ -247,9 +517,9 @@ inline bool buildChunkMesh(const ChunkKey& key,
                 const double sx = x + 0.5 + j0x, sy = y + 0.5 + j0y, sz = z + 0.5 + j0z;
 
                 size_t pos = 0;
-                for (size_t fi = 0; pos < fv.size(); ++fi)
+                for (size_t fi = 0; pos < fv.size() && !truncated; ++fi)
                 {
-                    const int cnt = fv[pos];
+                    const int cnt  = fv[pos];
                     const int* fvi = &fv[pos + 1];
                     pos += static_cast<size_t>(cnt) + 1;
 
@@ -260,13 +530,6 @@ inline bool buildChunkMesh(const ChunkKey& key,
                     if (solid[idx(x + o.dx + R, z + o.dz + R, y + o.dy + R)])
                         continue;  // за гранью твёрдый блок — не видна
 
-                    if (vertices.size() + static_cast<size_t>(cnt) > kMaxVertices)
-                    {
-                        truncated = true;
-                        break;
-                    }
-
-                    // Позиции вершин грани в координатах чанка.
                     double px[16], py[16], pz[16];
                     const int n = std::min(cnt, 16);
                     for (int i = 0; i < n; ++i)
@@ -275,72 +538,11 @@ inline bool buildChunkMesh(const ChunkKey& key,
                         py[i] = sy + vs[3 * fvi[i] + 1];
                         pz[i] = sz + vs[3 * fvi[i] + 2];
                     }
-
-                    // Нормаль из Voro++ + проверка обхода по Ньюэллу (CCW снаружи).
-                    float fnx = static_cast<float>(nm[3 * fi + 0]);
-                    float fny = static_cast<float>(nm[3 * fi + 1]);
-                    float fnz = static_cast<float>(nm[3 * fi + 2]);
-                    double ax_ = 0, ay_ = 0, az_ = 0;
-                    for (int i = 0; i < n; ++i)
-                    {
-                        const int j = (i + 1) % n;
-                        ax_ += (py[i] - py[j]) * (pz[i] + pz[j]);
-                        ay_ += (pz[i] - pz[j]) * (px[i] + px[j]);
-                        az_ += (px[i] - px[j]) * (py[i] + py[j]);
-                    }
-                    const bool reverse = ax_ * fnx + ay_ * fny + az_ * fnz < 0.0;
-
-                    // Тайл по направлению нормали: верх / низ / бок.
-                    const int kind = fny > 0.5f ? 2 : (fny < -0.5f ? 3 : 0);
-                    const auto tuv = calculateTileUV(getBlockTileIndex(bid, kind));
-
-                    // Планарная проекция UV вокруг центра грани.
-                    double cx = 0, cy = 0, cz = 0;
-                    for (int i = 0; i < n; ++i)
-                    {
-                        cx += px[i];
-                        cy += py[i];
-                        cz += pz[i];
-                    }
-                    cx /= n;
-                    cy /= n;
-                    cz /= n;
-                    double t1x, t1y, t1z, t2x, t2y, t2z;
-                    if (kind != 0)
-                    {  // верх/низ: u ← x, v ← z
-                        t1x = 1; t1y = 0; t1z = 0;
-                        t2x = 0; t2y = 0; t2z = 1;
-                    }
-                    else
-                    {  // бок: u ← up × n (вправо при взгляде снаружи), v ← y
-                        double hx = fnz, hz = -fnx;
-                        const double hl = std::sqrt(hx * hx + hz * hz);
-                        hx = hl > 1e-6 ? hx / hl : 1.0;
-                        hz = hl > 1e-6 ? hz / hl : 0.0;
-                        t1x = hx; t1y = 0; t1z = hz;
-                        t2x = 0; t2y = 1; t2z = 0;
-                    }
-
-                    const uint32_t base = static_cast<uint32_t>(vertices.size());
-                    for (int i = 0; i < n; ++i)
-                    {
-                        const int s = reverse ? (n - 1 - i) : i;
-                        const double dx = px[s] - cx, dy = py[s] - cy, dz = pz[s] - cz;
-                        float u = 0.5f + static_cast<float>(dx * t1x + dy * t1y + dz * t1z) * kUvScale;
-                        float v = 0.5f + static_cast<float>(dx * t2x + dy * t2y + dz * t2z) * kUvScale;
-                        u       = std::clamp(u, kUvInset, 1.0f - kUvInset);
-                        v       = std::clamp(v, kUvInset, 1.0f - kUvInset);
-                        vertices.push_back({static_cast<float>(px[s]), static_cast<float>(py[s]), static_cast<float>(pz[s]),
-                                            tuv[0] + u * (tuv[2] - tuv[0]), tuv[1] + v * (tuv[3] - tuv[1]), fnx, fny, fnz});
-                    }
-                    for (int i = 1; i + 1 < n; ++i)  // веер (грань выпуклая)
-                    {
-                        indices.emplace_back<uint32_t>(base);
-                        indices.emplace_back<uint32_t>(base + static_cast<uint32_t>(i));
-                        indices.emplace_back<uint32_t>(base + static_cast<uint32_t>(i) + 1u);
-                    }
+                    emitFace(bid, px, py, pz, n, static_cast<float>(nm[3 * fi + 0]), static_cast<float>(nm[3 * fi + 1]),
+                             static_cast<float>(nm[3 * fi + 2]), false);
                 }
             }
+        }
     return !truncated;
 }
 

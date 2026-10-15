@@ -18,8 +18,8 @@
 struct MeshJob
 {
     ChunkKey key{};
-    bool voronoi  = false;
-    uint32_t seed = 0;
+    bool voronoi = false;
+    biome::BiomeConfig biomes{};  ///< Копия конфига биомов на момент постановки задачи
 
     // Вход: снимок чанка и 4 соседей по X/Z (nullptr — сосед не загружен → воздух)
     std::unique_ptr<ChunkData> self;
@@ -47,7 +47,7 @@ void runMeshJob(MeshJob& j)
     {
         j.indices = ax::IndexArray(ax::backend::IndexFormat::U_INT);
         std::vector<voronoi::Vertex> verts;
-        j.truncated = !voronoi::buildChunkMesh(j.key, j.seed, *j.self, j.nbX0.get(), j.nbX1.get(), j.nbZ0.get(),
+        j.truncated = !voronoi::buildChunkMesh(j.key, j.biomes, *j.self, j.nbX0.get(), j.nbX1.get(), j.nbZ0.get(),
                                                j.nbZ1.get(), verts, j.indices);
         voronoi::packArrays(verts, j.positions, j.normals, j.uvs);
         j.built = !verts.empty() && !j.indices.empty();
@@ -502,7 +502,7 @@ ax::Node* ChunkManager::buildChunkVisualNode(const ChunkKey& key, ChunkData& dat
         // Воронои-меш легко переваливает за 65535 вершин → 32-битные индексы.
         inds = ax::IndexArray(ax::backend::IndexFormat::U_INT);
         std::vector<voronoi::Vertex> vverts;
-        if (!voronoi::buildChunkMesh(key, _cfg.voronoiSeed, data, neighborX0, neighborX1, neighborZ0, neighborZ1,
+        if (!voronoi::buildChunkMesh(key, _cfg.biomes, data, neighborX0, neighborX1, neighborZ0, neighborZ1,
                                      vverts, inds))
             AXLOGW("ChunkManager: voronoi mesh truncated at {} vertices (chunk {},{},{})", vverts.size(), key.x,
                    key.y, key.z);
@@ -720,7 +720,7 @@ bool ChunkManager::scheduleMeshJob(const ChunkKey& key, ChunkEntry& entry)
     auto job     = std::make_shared<MeshJob>();
     job->key     = key;
     job->voronoi = _cfg.voronoiTerrain;
-    job->seed    = _cfg.voronoiSeed;
+    job->biomes  = _cfg.biomes;
 
     // Снимок: копия блоков. ~131 КБ на чанк (uint16_t × 16·256·16) — memcpy порядка десятков мкс.
     job->self = std::make_unique<ChunkData>(*entry.chunkData);
