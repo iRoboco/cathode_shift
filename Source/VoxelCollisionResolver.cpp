@@ -106,24 +106,20 @@ void VoxelCollisionResolver::sweepAxis(float dt,
     // === BOUNDING BOX ПРОВЕРКА ===
     // Проверяем несколько уровней высоты с учётом радиуса.
     // Skin Width (radius - 0.02f) предотвращает застревание на углах блоков (corner snagging)
-    auto checkCollisionAt = [&](const ax::Vec3& pos) -> bool {
-        // Расширенный набор уровней проверки по Y.
-        // Добавлен уровень чуть ниже подошвы (-0.05f) — это критично при высоком FPS,
-        // когда шаг движения за кадр < 0.01, и точка yOff=0.01 не попадает в блок.
-        // Для отрицательных yOff проверяем только центр (без углов радиуса),
-        // т.к. капсула не расширяется вниз — это probe, а не физическое расширение.
-        float yLevels[] = {-0.05f, 0.01f, capsule.height * 0.5f, capsule.height - 0.01f};
+    // checkBodyAt — проверка тела капсулы (уровни от подошвы вверх).
+    // withGroundProbe добавляет точку на -0.05 ниже подошвы — это критично при высоком FPS,
+    // когда шаг движения за кадр < 0.01, и точка yOff=0.01 не попадает в блок.
+    // Для отрицательного смещения проверяем только центр (без углов радиуса),
+    // т.к. капсула не расширяется вниз — это probe, а не физическое расширение.
+    auto checkBodyAt = [&](const ax::Vec3& pos, bool withGroundProbe) -> bool {
+        float yLevels[] = {0.01f, capsule.height * 0.5f, capsule.height - 0.01f};
         float r         = capsule.radius - 0.02f;  // Skin width
+
+        if (withGroundProbe && isSolidAt(ax::Vec3(pos.x, pos.y - 0.05f, pos.z)))
+            return true;
 
         for (float yOff : yLevels)
         {
-            // Для отрицательных yOff — только центральный probe
-            if (yOff < 0.0f)
-            {
-                if (isSolidAt(ax::Vec3(pos.x, pos.y + yOff, pos.z)))
-                    return true;
-                continue;
-            }
             // 4 угла капсулы
             if (isSolidAt(pos + ax::Vec3(r, yOff, r)))
                 return true;
@@ -139,6 +135,13 @@ void VoxelCollisionResolver::sweepAxis(float dt,
         }
         return false;
     };
+    auto checkCollisionAt = [&](const ax::Vec3& pos) -> bool { return checkBodyAt(pos, true); };
+
+    // === ПОДЪЁМ НА СТУПЕНЬКУ (step-up, «лесенка») ===
+    // Макс. высота препятствия, на которое игрок поднимается без прыжка (1 блок).
+    constexpr float STEP_UP_HEIGHT = 1.0f;
+    constexpr float STEP_UP_PROBE  = 0.05f;  // Шаг сканирования высоты подъёма
+    bool steppedUp = false;  // Не более одного подъёма на ось за кадр
 
     // === ИНКРЕМЕНТАЛЬНАЯ РАЗВЁРТКА ===
     for (int i = 0; i < steps; ++i)
@@ -153,6 +156,27 @@ void VoxelCollisionResolver::sweepAxis(float dt,
 
         if (checkCollisionAt(testPos))
         {
+            // --- Подъём на ступеньку (только по горизонтали, стоя на земле) ---
+            // Сканируем высоту от STEP_UP_HEIGHT вниз: ищем наибольшую h, при которой
+            // тело свободно, а на h - STEP_UP_PROBE уже коллизия — ставим ногу ровно
+            // на верх препятствия (без «зависания» в воздухе до кадра гравитации).
+            if (axis != 1 && grounded && !steppedUp)
+            {
+                float stepY = -1.0f;
+                for (float h = STEP_UP_HEIGHT; h > 0.0f; h -= STEP_UP_PROBE)
+                {
+                    if (checkBodyAt(testPos + ax::Vec3(0.0f, h, 0.0f), false))
+                        break;
+                    stepY = h;
+                }
+                if (stepY > 0.0f)
+                {
+                    outResult.resolvedPosition = testPos + ax::Vec3(0.0f, stepY, 0.0f);
+                    steppedUp                  = true;
+                    continue;  // Шаг принят: поднялись на ступеньку, продолжаем движение
+                }
+            }
+
             // Коллизия обнаружена на этом шаге!
             float sign = (moveDelta > 0.0f) ? 1.0f : -1.0f;
 
