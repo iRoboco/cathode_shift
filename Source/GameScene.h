@@ -63,8 +63,9 @@ private:
     // Абстрактная ссылка для внешних систем (UI, звук, сеть)
     ax::Node* _playerNode          = nullptr;
     VoxelRaycasterNode* _raycaster = nullptr;
-    float _waterTime               = 0.0f;  ///< Накопитель времени для анимации воды
+    float _animTime                  = 0.0f;  ///< Общие часы анимации (волны воды, дрожание желе)
     std::vector<ax::Node*> _waterNodes;     ///< Кэш активных водных нодов для анимации
+    std::vector<ax::Node*> _terrainNodes;   ///< Кэш нодов террейна (дрожание желе: u_time в voronoi_terrain)
     bool _cameraUnderwater = false;         ///< Флаг: камера погружена в воду
 
     /// @brief Полноэкранный 2D-оверлей для имитации подводного освещения.

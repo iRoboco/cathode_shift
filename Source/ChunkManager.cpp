@@ -30,8 +30,8 @@ struct MeshJob
     // Выход (пишет воркер, читает главный поток после передачи через _meshDone под мьютексом)
     bool built     = false;  ///< Есть геометрия
     bool truncated = false;  ///< Воронои-меш усечён по kMaxVertices
-    std::vector<float> positions, normals, uvs;  ///< Воронои-путь
-    std::vector<ChunkVertex> cubeVerts;          ///< Кубический путь
+    std::vector<float> vertices;             ///< Воронои-путь: интерливинг pos3+normal3+uv2+jelly2
+    std::vector<ChunkVertex> cubeVerts;      ///< Кубический путь
     ax::IndexArray indices;
 };
 
@@ -49,7 +49,7 @@ void runMeshJob(MeshJob& j)
         std::vector<voronoi::Vertex> verts;
         j.truncated = !voronoi::buildChunkMesh(j.key, j.biomes, *j.self, j.nbX0.get(), j.nbX1.get(), j.nbZ0.get(),
                                                j.nbZ1.get(), verts, j.indices);
-        voronoi::packArrays(verts, j.positions, j.normals, j.uvs);
+        voronoi::packVertices(verts, j.vertices);
         j.built = !verts.empty() && !j.indices.empty();
     }
     else
@@ -562,6 +562,15 @@ ax::Node* ChunkManager::finishChunkNode(const ChunkKey& key, ax::Mesh* mesh)
             auto* ps = new ax::backend::ProgramState(program);
             if (_terrainAtlas)
                 ps->setTexture(ps->getUniformLocation("u_tex0"), 0, _terrainAtlas->getBackendTexture());
+            if (_cfg.voronoiTerrain)
+            {
+                // Желейное дрожание считается по мировым координатам (как волны воды):
+                // origin чанка задаётся один раз здесь, u_time обновляет GameScene::update().
+                ax::Vec3 origin = chunkToWorld(key);
+                auto locOrigin  = ps->getUniformLocation("u_chunkOrigin");
+                if (locOrigin)
+                    ps->setUniform(locOrigin, &origin, sizeof(ax::Vec3));
+            }
             chunkNode->setProgramState(ps);  // заменяет программу, сохраняя state-block
             ps->release();                   // нод удерживает свою ссылку
         }
@@ -794,8 +803,7 @@ void ChunkManager::processMeshResults(bool force)
         {
             if (job->truncated)
                 AXLOGW("ChunkManager: voronoi mesh truncated (chunk {},{},{})", key.x, key.y, key.z);
-            mesh = job->voronoi ? voronoi::createMeshFromArrays(job->positions, job->normals, job->uvs, job->indices,
-                                                                _terrainAtlas)
+            mesh = job->voronoi ? voronoi::createMeshFromInterleaved(job->vertices, job->indices, _terrainAtlas)
                                 : createMesh(job->cubeVerts, job->indices, _terrainAtlas);
         }
         ax::Node* node = mesh ? finishChunkNode(key, mesh) : nullptr;

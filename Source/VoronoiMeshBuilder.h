@@ -24,6 +24,13 @@
  *   • softness > 0 (желейный биом) → к вершинам применяется поле смещений D(p), непрерывное по
  *     позиции: общие вершины соседних ячеек смещаются одинаково → трещин нет.
  *
+ * Желейное ДРОЖАНИЕ (анимация) живёт в вершинном шейдере voronoi_terrain.vert — по аналогии
+ * с волнами воды: смещение суммой синусоид от мировых координат и u_time. Мешер лишь запекает
+ * в каждую вершину два параметра (атрибут a_texCoord1): маску дрожания k = softness·surf
+ * (та же весовая функция, что у статической деформации → трясётся ровно то, что «оплывает»)
+ * и нагрузку load (под толщей блоков дрожание затухает). Поля непрерывны по позиции,
+ * поэтому дрожание бесшовное и на границах чанков, и на границах биомов (k → 0).
+ *
  * Ячейки строятся только для приповерхностных блоков (твёрдый блок с воздухом/водой в окне 3×3×3).
  * Грань рисуется, если блок за ней не твёрдый. Вода/воздух — «не твёрдые».
  */
@@ -50,12 +57,14 @@ constexpr int   kJellyLoadCap = 12;
 /// Страховочный лимит вершин на меш (индексы 32-битные).
 constexpr size_t kMaxVertices = 4000000;
 
-/// Вершина: позиция, UV атласа, нормаль грани (flat shading).
+/// Вершина: позиция, UV атласа, нормаль грани (flat shading), параметры желе
+/// (jm — маска дрожания k = softness·surf, jl — нагрузка 0..1; уходят в a_texCoord1 шейдера).
 struct Vertex
 {
     float x, y, z;
     float u, v;
     float nx, ny, nz;
+    float jm, jl;
 };
 
 struct Offset
@@ -242,8 +251,10 @@ inline bool buildChunkMesh(const ChunkKey& key,
     // ---- 5. Желе: поле смещений узлов решётки (лениво, только если в чанке есть softness > 0) ----
     // Узел (a,b,c) — угол блоков (a-1..a, b-1..b, c-1..c) паддинга; в локальных координатах чанка
     // он лежит в (a-R, b-R, c-R). D — функция ТОЛЬКО позиции → общие вершины смещаются одинаково.
+    // На узел храним 5 float: статическое смещение (3) + маска дрожания k + нагрузка load
+    // (последние два — в вершинный атрибут a_texCoord1 для шейдерного дрожания).
     std::vector<uint8_t> over;       // нагрузка: сколько твёрдых блоков НАД ячейкой в колонке (кап)
-    std::vector<float> nodeD;        // 3 float на узел
+    std::vector<float> nodeD;        // 5 float на узел: dx,dy,dz, маска k, нагрузка load
     std::vector<uint8_t> nodeReady;
     const int NA = PX + 1, NC2 = PZ + 1, NB = PY + 1;
     auto nidx = [&](int a, int b, int c) { return (static_cast<size_t>(c) * NA + a) * NB + b; };
@@ -260,7 +271,7 @@ inline bool buildChunkMesh(const ChunkKey& key,
                     cnt += solid[idx(px, pz, py)];
                 }
             }
-        nodeD.assign(static_cast<size_t>(NA) * NC2 * NB * 3, 0.0f);
+        nodeD.assign(static_cast<size_t>(NA) * NC2 * NB * 5, 0.0f);
         nodeReady.assign(static_cast<size_t>(NA) * NC2 * NB, 0);
     }
     auto nodeDisp = [&](int a, int b, int c) -> const float* {
@@ -268,7 +279,7 @@ inline bool buildChunkMesh(const ChunkKey& key,
         b = std::clamp(b, 1, PY - 1);
         c = std::clamp(c, 1, PZ - 1);
         const size_t ni = nidx(a, b, c);
-        float* d        = &nodeD[ni * 3];
+        float* d        = &nodeD[ni * 5];
         if (nodeReady[ni])
             return d;
         nodeReady[ni] = 1;
@@ -301,15 +312,18 @@ inline bool buildChunkMesh(const ChunkKey& key,
         d[0]          = -static_cast<float>(gx) * 0.25f * kJellyBulge * (0.5f + 0.5f * load) * k;
         d[1]          = (-static_cast<float>(gy) * 0.25f * kJellyBulge * (0.5f + 0.5f * load) - kJellySag * load) * k;
         d[2]          = -static_cast<float>(gz) * 0.25f * kJellyBulge * (0.5f + 0.5f * load) * k;
+        d[3]          = k;     // маска шейдерного дрожания (та же весовая функция)
+        d[4]          = load;  // нагрузка: в шейдере ей глушится дрожание под толщей
         return d;
     };
     // Трилинейная интерполяция поля смещений в локальной точке чанка p.
-    auto displace = [&](double& x, double& y, double& z) {
+    // Попутно отдаёт интерполированные маску дрожания и нагрузку (можно передать nullptr).
+    auto displace = [&](double& x, double& y, double& z, float* outMask, float* outLoad) {
         const double qx = x + R, qy = y + R, qz = z + R;  // координаты в пространстве узлов паддинга
         const int a = static_cast<int>(std::floor(qx)), b = static_cast<int>(std::floor(qy)),
                   c      = static_cast<int>(std::floor(qz));
         const double fx = qx - a, fy = qy - b, fz = qz - c;
-        double dx = 0, dy = 0, dz = 0;
+        double dx = 0, dy = 0, dz = 0, dm = 0, dl = 0;
         for (int k = 0; k <= 1; ++k)
             for (int j = 0; j <= 1; ++j)
                 for (int i = 0; i <= 1; ++i)
@@ -321,10 +335,16 @@ inline bool buildChunkMesh(const ChunkKey& key,
                     dx += w * d[0];
                     dy += w * d[1];
                     dz += w * d[2];
+                    dm += w * d[3];
+                    dl += w * d[4];
                 }
         x += dx;
         y += dy;
         z += dz;
+        if (outMask)
+            *outMask = static_cast<float>(dm);
+        if (outLoad)
+            *outLoad = static_cast<float>(dl);
     };
 
     // ---- 6. Эмиссия одной грани (общая для кубического и воронои-пути) ----
@@ -397,10 +417,12 @@ inline bool buildChunkMesh(const ChunkKey& key,
             V[i]    = tuv[1] + v * (tuv[3] - tuv[1]);
         }
 
-        // Желейная деформация вершин (непрерывное поле по позиции).
+        // Желейная деформация вершин (непрерывное поле по позиции) + запекание
+        // маски дрожания и нагрузки в вершинный атрибут (для шейдерной анимации).
+        float JM[16] = {}, JL[16] = {};
         if (anySoft)
             for (int i = 0; i < m; ++i)
-                displace(px[i], py[i], pz[i]);
+                displace(px[i], py[i], pz[i], &JM[i], &JL[i]);
 
         // Нормаль грани: по итоговому (возможно смещённому) полигону; запасной вариант — номинальная.
         double nnx = 0, nny = 0, nnz = 0;
@@ -423,7 +445,7 @@ inline bool buildChunkMesh(const ChunkKey& key,
         const uint32_t base = static_cast<uint32_t>(vertices.size());
         for (int i = 0; i < m; ++i)
             vertices.push_back({static_cast<float>(px[i]), static_cast<float>(py[i]), static_cast<float>(pz[i]), U[i],
-                                V[i], ox, oy, oz});
+                                V[i], ox, oy, oz, JM[i], JL[i]});
         for (int i = 1; i + 1 < m; ++i)  // веер (грань выпуклая)
         {
             indices.emplace_back<uint32_t>(base);
@@ -546,53 +568,74 @@ inline bool buildChunkMesh(const ChunkKey& key,
     return !truncated;
 }
 
-/// Раскладывает вершины в раздельные массивы для ax::Mesh::create. Чистая функция —
-/// вызывается в ВОРКЕРЕ, чтобы в главном потоке остался только вызов Mesh::create.
-inline void packArrays(const std::vector<Vertex>& vertices,
-                       std::vector<float>& positions,
-                       std::vector<float>& normals,
-                       std::vector<float>& uvs)
+/// Число float на вершину в интерливинге: pos(3) + normal(3) + uv(2) + jelly(2).
+constexpr int kVertexStride = 10;
+
+/**
+ * @brief Вершинный layout воронои-меша для ax::Mesh::create(vertices, stride, indices, attribs).
+ *
+ * Желейные параметры (маска дрожания, нагрузка) едут в слоте VERTEX_ATTRIB_TEX_COORD1.
+ * ВАЖНО: axmol биндит атрибуты меша к программе по ИМЕНИ (VertexAttribBinding →
+ * shaderinfos::getAttributeName), поэтому в шейдере этот атрибут обязан называться
+ * ровно a_texCoord1 и лежать на layout(location = TEXCOORD1).
+ */
+inline const std::vector<ax::MeshVertexAttrib>& vertexAttribs()
+{
+    static const std::vector<ax::MeshVertexAttrib> attribs = {
+        {ax::backend::VertexFormat::FLOAT3, ax::shaderinfos::VertexKey::VERTEX_ATTRIB_POSITION},
+        {ax::backend::VertexFormat::FLOAT3, ax::shaderinfos::VertexKey::VERTEX_ATTRIB_NORMAL},
+        {ax::backend::VertexFormat::FLOAT2, ax::shaderinfos::VertexKey::VERTEX_ATTRIB_TEX_COORD},
+        {ax::backend::VertexFormat::FLOAT2, ax::shaderinfos::VertexKey::VERTEX_ATTRIB_TEX_COORD1},
+    };
+    return attribs;
+}
+
+/// Раскладывает вершины в интерливинг pos3+normal3+uv2+jelly2 для ax::Mesh::create.
+/// Чистая функция — вызывается в ВОРКЕРЕ, чтобы в главном потоке остался только вызов Mesh::create.
+inline void packVertices(const std::vector<Vertex>& vertices, std::vector<float>& out)
 {
     const size_t n = vertices.size();
-    positions.resize(n * 3);
-    normals.resize(n * 3);
-    uvs.resize(n * 2);
+    out.resize(n * kVertexStride);
     for (size_t i = 0; i < n; ++i)
     {
-        positions[i * 3 + 0] = vertices[i].x;
-        positions[i * 3 + 1] = vertices[i].y;
-        positions[i * 3 + 2] = vertices[i].z;
-        normals[i * 3 + 0]   = vertices[i].nx;
-        normals[i * 3 + 1]   = vertices[i].ny;
-        normals[i * 3 + 2]   = vertices[i].nz;
-        uvs[i * 2 + 0]       = vertices[i].u;
-        uvs[i * 2 + 1]       = vertices[i].v;
+        const Vertex& v = vertices[i];
+        float* p        = &out[i * kVertexStride];
+        p[0]            = v.x;
+        p[1]            = v.y;
+        p[2]            = v.z;
+        p[3]            = v.nx;
+        p[4]            = v.ny;
+        p[5]            = v.nz;
+        p[6]            = v.u;
+        p[7]            = v.v;
+        p[8]            = v.jm;
+        p[9]            = v.jl;
     }
 }
 
-/// Создаёт ax::Mesh из готовых массивов (ТОЛЬКО главный поток: аллоцирует GPU-буферы).
-inline ax::Mesh* createMeshFromArrays(const std::vector<float>& positions,
-                                      const std::vector<float>& normals,
-                                      const std::vector<float>& uvs,
-                                      const ax::IndexArray& indices,
-                                      ax::Texture2D* texture)
+/// Создаёт ax::Mesh из интерливингового буфера (ТОЛЬКО главный поток: аллоцирует GPU-буферы).
+/// AABB считает движок по первым трём float вершины (позиции) — наш layout это удовлетворяет.
+inline ax::Mesh* createMeshFromInterleaved(const std::vector<float>& verts,
+                                           const ax::IndexArray& indices,
+                                           ax::Texture2D* texture)
 {
-    if (positions.empty() || indices.empty())
+    if (verts.empty() || indices.empty())
         return nullptr;
-    auto* mesh = ax::Mesh::create(positions, normals, uvs, indices);
+    auto* mesh = ax::Mesh::create(verts, kVertexStride, indices, vertexAttribs());
     if (mesh && texture)
         mesh->setTexture(texture);
     return mesh;
 }
 
-/// Создаёт ax::Mesh с НАСТОЯЩИМИ нормалями (в отличие от createMesh() для кубов — заглушка).
+/// Создаёт ax::Mesh с НАСТОЯЩИМИ нормалями и желейными атрибутами
+/// (в отличие от createMesh() для кубов — там нормали-заглушки и нет a_texCoord1).
 inline ax::Mesh* createMesh(const std::vector<Vertex>& vertices, const ax::IndexArray& indices, ax::Texture2D* texture)
 {
     if (vertices.empty() || indices.empty())
         return nullptr;
-    std::vector<float> positions, normals, uvs;
-    packArrays(vertices, positions, normals, uvs);
-    return createMeshFromArrays(positions, normals, uvs, indices, texture);
+    std::vector<float> packed;
+    packVertices(vertices, packed);
+    return createMeshFromInterleaved(packed, indices, texture);
 }
 
 }  // namespace voronoi

@@ -127,6 +127,11 @@ void MainMenuScene::setupChunkManager()
     // textureFilter выше остаётся фолбэком, если выключить pixelArtAA.
     // Значение берём из настроек (общее с игрой), по умолчанию включено.
     cfg.pixelArtAA             = UserDefault::getInstance()->getBoolForKey(kKeyPixelArtAA, true);
+
+    cfg.biomes.frequency = {0.40f, 0.20f, 0.40f, 0.0f, 0.0f};
+    cfg.biomes.macroCellSize = 64;
+    cfg.biomes.blendWidth = 16;
+
     _chunkMgr.init(cfg);
 
     // Генерация в фоновом потоке: полный перлиновый террейн (как в GameScene).
@@ -187,17 +192,21 @@ void MainMenuScene::setupChunkManager()
     });
 
     // Визуализация в главном потоке: маска USER1, добавление в граф сцены.
+    // Водный нод помечен WATER_NODE_TAG в buildWaterVisualNode — различаем по тегу.
     _chunkMgr.setOnVisualize([this](Node* node, const ChunkKey&) {
         if (!node)
             return;
         node->setCameraMask(static_cast<unsigned short>(CameraFlag::USER1));
         addChild(node);
+        if (node->getTag() != WATER_NODE_TAG)
+            _terrainNodes.push_back(node);  // террейн: покадровый u_time для дрожания желе
     });
 
     // Выгрузка в главном потоке: безопасное удаление нода.
-    _chunkMgr.setOnUnload([](Node* node, const ChunkKey&) {
+    _chunkMgr.setOnUnload([this](Node* node, const ChunkKey&) {
         if (node)
             node->removeFromParentAndCleanup(true);
+        _terrainNodes.erase(std::remove(_terrainNodes.begin(), _terrainNodes.end(), node), _terrainNodes.end());
     });
 
     // === Колбеки водных нодов для анимации ===
@@ -230,12 +239,12 @@ void MainMenuScene::update(float dt)
         _orbitCamera->lookAt(_worldCenter, Vec3::UNIT_Y);
     }
 
-    // === Анимация воды ===
-    _waterTime += dt;
+    // === Анимация воды и желе ===
+    _animTime += dt;
 
     // Базовая opacity воды (надводный режим, как в GameScene)
     uint8_t waterOpacity = static_cast<uint8_t>(165u + std::clamp(
-        static_cast<int>(std::sin(_waterTime * 2.0f) * 12.0f), 0, 35));
+        static_cast<int>(std::sin(_animTime * 2.0f) * 12.0f), 0, 35));
 
     const ax::Vec3 camWorld = _orbitCamera ? _orbitCamera->getPosition3D() : ax::Vec3::ZERO;
 
@@ -253,7 +262,7 @@ void MainMenuScene::update(float dt)
         {
             auto locTime = ps->getUniformLocation("u_time");
             auto locCam  = ps->getUniformLocation("u_camWorld");
-            ps->setUniform(locTime, &_waterTime, sizeof(float));
+            ps->setUniform(locTime, &_animTime, sizeof(float));
             ps->setUniform(locCam, &camWorld, sizeof(ax::Vec3));
 
             // Расширяем fogEnd (по умолчанию = renderDist*CHUNK_SIZE = 160),
@@ -266,6 +275,21 @@ void MainMenuScene::update(float dt)
             auto locFogEnd = ps->getUniformLocation("u_fogEnd");
             ps->setUniform(locFogSt, &fogStart, sizeof(float));
             ps->setUniform(locFogEnd, &fogEnd, sizeof(float));
+        }
+    }
+
+    // === Дрожание желе: те же часы анимации уходят в шейдер террейна ===
+    for (auto* node : _terrainNodes)
+    {
+        if (!node)
+            continue;
+        auto* mr = static_cast<ax::MeshRenderer*>(node);
+        if (auto* ps = mr->getProgramState())
+        {
+            // У шейдеров без u_time (terrain_vs, встроенный UNLIT) — пропускаем.
+            auto locTime = ps->getUniformLocation("u_time");
+            if (locTime)
+                ps->setUniform(locTime, &_animTime, sizeof(float));
         }
     }
 

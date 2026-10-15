@@ -146,11 +146,11 @@ public:
      * auto* mr  = dynamic_cast<ax::MeshRenderer*>(node);
      * auto* mat = dynamic_cast<ax::MeshMaterial*>(mr->getMaterial());
      * auto* ps  = mat->getTechnique()->getPassByIndex(0)->getProgramState();
-     * WaterShader::updateTime(ps, _waterTime);
+     * WaterShader::updateTime(ps, _animTime);
      * @endcode
      *
      * @param ps   ProgramState водного нода (может быть nullptr — тогда вызов игнорируется)
-     * @param time Накопленное время в секундах (_waterTime из GameScene)
+     * @param time Накопленное время в секундах (_animTime из GameScene)
      */
     static void updateTime(ax::backend::ProgramState* ps, float time)
     {

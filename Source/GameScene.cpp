@@ -102,12 +102,12 @@ bool GameScene::init()
 
     // Конфигурация чанков
     ChunkManager::Config cfg;
-    cfg.renderDistance           = userRenderDist;
-    cfg.unloadMargin             = 3;
-    cfg.workerThreadCount        = std::max(1u, std::thread::hardware_concurrency() / 2);
-    cfg.maxGenerationsPerFrame   = 2;
-    cfg.maxUnloadsPerFrame       = 4;
-    cfg.maxQueueSize             = 128;
+    cfg.renderDistance         = userRenderDist;
+    cfg.unloadMargin           = 3;
+    cfg.workerThreadCount      = std::max(1u, std::thread::hardware_concurrency() / 2);
+    cfg.maxGenerationsPerFrame = 2;
+    cfg.maxUnloadsPerFrame     = 4;
+    cfg.maxQueueSize           = 128;
     // Подняли с 2 до 4: после фиксов мешинга (реалистичный reserve + обрезка по Y)
     // и отложенной перестройки до «оседания» соседей каждый ребилд стал заметно
     // дешевле и реже, поэтому осевшую пачку чанков можно разгребать быстрее.
@@ -115,7 +115,10 @@ bool GameScene::init()
     // Кастомный шейдер террейна: antialiased pixel art (резко вблизи, без дрожания
     // вдали). Атлас при этом грузится с LINEAR_MIPMAP_LINEAR. Управляется из меню
     // паузы и сохраняется в UserDefault (по умолчанию включён).
-    cfg.pixelArtAA               = ud->getBoolForKey(kKeyPixelArtAA, true);
+    cfg.pixelArtAA       = ud->getBoolForKey(kKeyPixelArtAA, true);
+
+    cfg.biomes.frequency = {0.50f, 0.25f, 0.25f, 0.0f, 0.0f};
+
     _chunkMgr.init(cfg);
 
     // Генерация мира
@@ -205,14 +208,17 @@ bool GameScene::init()
         // Если это водный нод — добавляем в список для анимации
         if (isWater)
             _waterNodes.push_back(node);
+        else
+            _terrainNodes.push_back(node);  // террейн: покадровый u_time для дрожания желе
     });
 
     _chunkMgr.setOnUnload([this](ax::Node* node, const ChunkKey& key) {
         if (!node)
             return;
         node->removeFromParentAndCleanup(true);
-        // Удаляем ссылку из кэша анимации (remove-erase idiom)
+        // Удаляем ссылку из кэшей анимации (remove-erase idiom)
         _waterNodes.erase(std::remove(_waterNodes.begin(), _waterNodes.end(), node), _waterNodes.end());
+        _terrainNodes.erase(std::remove(_terrainNodes.begin(), _terrainNodes.end(), node), _terrainNodes.end());
     });
 
     // Создание контроллера (чувствительность мыши — из настроек)
@@ -351,7 +357,7 @@ void GameScene::update(float dt)
         return;
 
     // === Анимация воды и детектирование погружения ===
-    _waterTime += dt;
+    _animTime += dt;
 
     // Определяем, погружена ли камера в воду по позиции глаз игрока.
     // Глаза располагаются на высоте 0.85 × высота капсулы (1.8) = ~1.53 над подошвой.
@@ -389,7 +395,7 @@ void GameScene::update(float dt)
 
     // Плавная пульсация (0.15 Гц) — живость поверхности
     uint8_t waterOpacity =
-        static_cast<uint8_t>(baseOpacity + std::clamp(static_cast<int>(std::sin(_waterTime * 2.0f) * 12.0f), 0, 35));
+        static_cast<uint8_t>(baseOpacity + std::clamp(static_cast<int>(std::sin(_animTime * 2.0f) * 12.0f), 0, 35));
 
     const ax::Vec3 camWorld = _mainCamera ? _mainCamera->getPosition3D() : ax::Vec3::ZERO;
 
@@ -408,8 +414,26 @@ void GameScene::update(float dt)
         {
             auto locTime = ps->getUniformLocation("u_time");
             auto locCam  = ps->getUniformLocation("u_camWorld");
-            ps->setUniform(locTime, &_waterTime, sizeof(float));
+            ps->setUniform(locTime, &_animTime, sizeof(float));
             ps->setUniform(locCam, &camWorld, sizeof(ax::Vec3));
+        }
+    }
+
+    // === Дрожание желе: те же часы анимации уходят в шейдер террейна ===
+    // Смещение считается в вершинном шейдере по мировым координатам (маска
+    // запечена в вершинах), поэтому здесь только тикаем u_time для каждого нода.
+    for (auto* node : _terrainNodes)
+    {
+        if (!node)
+            continue;
+        auto* mr = static_cast<ax::MeshRenderer*>(node);
+        if (auto* ps = mr->getProgramState())
+        {
+            // У pixel-art шейдера (terrain_vs) и встроенного UNLIT u_time нет —
+            // getUniformLocation вернёт невалидный location, пропускаем их.
+            auto locTime = ps->getUniformLocation("u_time");
+            if (locTime)
+                ps->setUniform(locTime, &_animTime, sizeof(float));
         }
     }
 
