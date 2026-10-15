@@ -117,7 +117,9 @@ bool GameScene::init()
     // паузы и сохраняется в UserDefault (по умолчанию включён).
     cfg.pixelArtAA       = ud->getBoolForKey(kKeyPixelArtAA, true);
 
-    cfg.biomes.frequency = {0.50f, 0.25f, 0.25f, 0.0f, 0.0f};
+    cfg.biomes.frequency     = {0.40f, 0.20f, 0.40f, 0.0f, 0.0f};
+    cfg.biomes.macroCellSize = 64;
+    cfg.biomes.blendWidth    = 16;
 
     _chunkMgr.init(cfg);
 
