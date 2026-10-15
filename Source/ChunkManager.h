@@ -213,6 +213,9 @@ private:
     int _maxFilledY = -1;          ///< Самый высокий непустой блок (для обрезки мешинга по Y)
 };
 
+/// @brief Задача фоновой сборки меша (определена в ChunkManager.cpp; снимок данных + результат)
+struct MeshJob;
+
 /// @brief Статус жизненного цикла чанка в менеджере
 enum class ChunkStatus
 {
@@ -297,6 +300,17 @@ public:
 
         /// @brief Сид джиттера Вороного. Привяжите к сиду мира, чтобы геометрия была воспроизводимой.
         uint32_t voronoiSeed = 1337u;
+
+        /// @brief Сборка мешей террейна в фоновых воркерах (общая очередь с генерацией).
+        /// false → прежнее поведение: меш строится синхронно в главном потоке.
+        bool asyncMeshing = true;
+
+        /// @brief Макс. число одновременно «в полёте» задач сборки (очередь + выполняются + ждут применения).
+        /// Каждая задача держит снимок 5 чанков (~650 КБ при 16-бит BlockId), поэтому лимит ограничивает память.
+        int maxMeshJobsInFlight = 24;
+
+        /// @brief Сколько готовых мешей применять (создание ax::Mesh/нода) за кадр.
+        int maxMeshAppliesPerFrame = 4;
     };
 
     /// @} // конец группы "Конфигурация"
@@ -585,6 +599,11 @@ private:
         /// @brief Флаг необходимости перестроения меша
         ///< Устанавливается при загрузке соседей: грани на стыке могут стать невидимыми
         bool dirty = false;
+
+        /// @brief Задача сборки меша «в полёте» (nullptr — нет). Доступ только из главного потока.
+        /// Пока задача жива, новые для этого чанка не ставятся; dirty, выставленный за это время,
+        /// переживёт применение результата и вызовет следующую пересборку.
+        std::shared_ptr<MeshJob> meshJob;
     };
 
     /**
@@ -603,7 +622,8 @@ private:
         struct Item
         {
             ChunkKey key;
-            int priority;  ///< Расстояние до игрока (0 = самый ближний)
+            int priority;                  ///< Меньше = раньше (расстояние до игрока, удвоенное; см. push/pushMesh)
+            std::shared_ptr<MeshJob> mesh; ///< != nullptr → задача сборки меша, иначе — генерация чанка
 
             // Инвертированное сравнение для превращения max-heap в min-heap:
             // если this.priority > other.priority, то this считается "меньшим",
@@ -613,40 +633,57 @@ private:
 
         std::mutex mtx;
         std::condition_variable cv;
-        std::priority_queue<Item> queue;  ///< Приоритетная очередь задач
+        std::priority_queue<Item> queue;  ///< Приоритетная очередь задач (генерация + сборка мешей)
         bool stop      = false;           ///< Флаг корректного завершения воркеров
-        size_t maxSize = 128;             ///< Лимит для защиты от переполнения памяти
+        size_t maxSize = 128;             ///< Лимит ГЕНЕРАЦИИ для защиты от переполнения памяти
+        size_t genCount = 0;              ///< Сколько задач генерации сейчас в очереди (под mtx)
 
         /**
-         * @brief Добавить задачу в очередь (потокобезопасно)
+         * @brief Добавить задачу генерации (потокобезопасно)
          * @param k Ключ чанка
          * @param priority Расстояние до игрока (используется для сортировки)
-         * @return true если задача добавлена, false если очередь переполнена
+         * @return true если задача добавлена, false если очередь генерации переполнена
+         * @note Приоритет удваивается, чтобы между соседними расстояниями поместились задачи сборки мешей.
          */
         bool push(const ChunkKey& k, int priority)
         {
             std::lock_guard<std::mutex> lk(mtx);
-            if (queue.size() >= maxSize)
-                return false;  ///< Очередь полна → сигнализируем вызывающему коду
-            queue.push({k, priority});
+            if (genCount >= maxSize)
+                return false;  ///< Очередь генерации полна → сигнализируем вызывающему коду
+            queue.push({k, priority * 2, nullptr});
+            ++genCount;
             cv.notify_one();  ///< Пробуждаем один ожидающий воркер
             return true;
         }
 
         /**
+         * @brief Добавить задачу сборки меша. Лимит maxSize не применяется (лимит — в ChunkManager).
+         * @note Приоритет 2·dist − 1: при равной дальности сборка идёт РАНЬШЕ генерации — готовая
+         *       геометрия рядом с игроком важнее нового чанка на том же расстоянии.
+         */
+        void pushMesh(std::shared_ptr<MeshJob> job, const ChunkKey& k, int priority)
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            queue.push({k, priority * 2 - 1, std::move(job)});
+            cv.notify_one();
+        }
+
+        /**
          * @brief Извлечь задачу с наивысшим приоритетом (блокирующее ожидание)
-         * @param out Выходной параметр для ключа чанка
+         * @param out Выходной параметр
          * @return false если остановка запрошена и очередь пуста, иначе true
          */
-        bool pop(ChunkKey& out)
+        bool pop(Item& out)
         {
             std::unique_lock<std::mutex> lk(mtx);
             // Блокировка до появления задачи или сигнала остановки
             cv.wait(lk, [&] { return stop || !queue.empty(); });
             if (stop && queue.empty())
-                return false;       ///< Воркеры завершают цикл
-            out = queue.top().key;  ///< Берём ближайший чанк
-            queue.pop();            ///< Удаляем из кучи
+                return false;  ///< Воркеры завершают цикл
+            out = queue.top();  ///< Берём ближайшую задачу (копия: shared_ptr дёшев)
+            queue.pop();        ///< Удаляем из кучи
+            if (!out.mesh)
+                --genCount;
             return true;
         }
 
@@ -669,7 +706,8 @@ private:
             std::lock_guard<std::mutex> lk(mtx);
             while (!queue.empty())
                 queue.pop();
-            stop = false;  ///< Сбрасываем, чтобы при resume pop() снова ждал задачи
+            genCount = 0;
+            stop     = false;  ///< Сбрасываем, чтобы при resume pop() снова ждал задачи
         }
     };
 
@@ -864,6 +902,33 @@ private:
     ax::Node* buildChunkVisualNode(const ChunkKey& key, ChunkData& data);
 
     /**
+     * @brief Собирает нод чанка из готового ax::Mesh (материал, шейдер, позиция).
+     * @note Общая часть синхронного (buildChunkVisualNode) и асинхронного (processMeshResults) путей.
+     */
+    ax::Node* finishChunkNode(const ChunkKey& key, ax::Mesh* mesh);
+
+    /**
+     * @brief Ставит задачу фоновой сборки меша чанка.
+     *
+     * Копирует блоки чанка и 4 соседей по X/Z в задачу (снимок) — воркер НЕ читает живые данные,
+     * поэтому правки блоков и выгрузка соседей в главном потоке безопасны. Сбрасывает entry.dirty:
+     * любая правка после снимка снова выставит его и вызовет пересборку.
+     * @return false, если задачу поставить нельзя сейчас (пауза, уже есть задача, лимит в полёте);
+     *         вызывающий должен оставить/выставить entry.dirty, чтобы повторить позже.
+     */
+    bool scheduleMeshJob(const ChunkKey& key, ChunkEntry& entry);
+
+    /// @brief Помечает задачу чанка отменённой (воркер пропустит работу, результат будет отброшен).
+    static void cancelMeshJob(ChunkEntry& entry);
+
+    /**
+     * @brief Применяет готовые меши в главном потоке: создаёт ax::Mesh/ноды и заменяет старые.
+     * @param force true → без лимита per-frame и без проверки паузы (используется в pause()).
+     * @note Результат применяется, только если он всё ещё актуален для entry.meshJob и чанк Active.
+     */
+    void processMeshResults(bool force = false);
+
+    /**
      * @brief Создаёт визуальный нод для водного меша чанка.
      * @details Формирует геометрию только для поверхности воды и открытых граней,
      * контактирующих с воздухом. Использует кросс-чанковые данные для устранения щелей.
@@ -934,7 +999,12 @@ private:
     ///< Доступ только из главного потока для предотвращения дублирования задач
     std::unordered_set<ChunkKey, ChunkKey::Hash> _genPendingSet;
 
-    std::vector<std::thread> _workers;  ///< Пул фоновых потоков генерации
+    std::vector<std::thread> _workers;  ///< Пул фоновых потоков (генерация чанков + сборка мешей)
+
+    std::mutex _meshDoneMtx;  ///< Защищает _meshDone
+    /// @brief Завершённые воркерами задачи сборки (запись: воркеры, чтение: главный поток)
+    std::vector<std::shared_ptr<MeshJob>> _meshDone;
+    int _meshInFlight = 0;  ///< Задач сборки в полёте (только главный поток): +1 при постановке, −1 при разборе результата
 
     std::atomic<bool> _running{false};  ///< Флаг работы воркеров (atomic для межпоточной видимости)
 

@@ -5,7 +5,60 @@
 #include "renderer/backend/ProgramManager.h"
 #include "renderer/backend/ProgramState.h"
 #include <algorithm>
+#include <atomic>
 #include <climits>
+
+// =========================================================================
+//  MeshJob — задача фоновой сборки меша
+// =========================================================================
+//  Воркер работает ТОЛЬКО со снимком (копии ChunkData), а не с живыми данными
+//  _chunks: главный поток вправе менять блоки и выгружать соседей, пока задача
+//  в очереди/выполняется. Результат — CPU-массивы; GPU-объекты (ax::Mesh, ноды)
+//  создаются исключительно в главном потоке в processMeshResults().
+struct MeshJob
+{
+    ChunkKey key{};
+    bool voronoi  = false;
+    uint32_t seed = 0;
+
+    // Вход: снимок чанка и 4 соседей по X/Z (nullptr — сосед не загружен → воздух)
+    std::unique_ptr<ChunkData> self;
+    std::unique_ptr<ChunkData> nbX0, nbX1, nbZ0, nbZ1;
+
+    std::atomic<bool> cancelled{false};  ///< Выставляется главным потоком (выгрузка/пересоздание чанка)
+
+    // Выход (пишет воркер, читает главный поток после передачи через _meshDone под мьютексом)
+    bool built     = false;  ///< Есть геометрия
+    bool truncated = false;  ///< Воронои-меш усечён по kMaxVertices
+    std::vector<float> positions, normals, uvs;  ///< Воронои-путь
+    std::vector<ChunkVertex> cubeVerts;          ///< Кубический путь
+    ax::IndexArray indices;
+};
+
+namespace
+{
+/// Выполняется в воркере. Не трогает ничего, кроме полей задачи.
+void runMeshJob(MeshJob& j)
+{
+    if (j.cancelled.load(std::memory_order_relaxed) || !j.self)
+        return;
+
+    if (j.voronoi)
+    {
+        j.indices = ax::IndexArray(ax::backend::IndexFormat::U_INT);
+        std::vector<voronoi::Vertex> verts;
+        j.truncated = !voronoi::buildChunkMesh(j.key, j.seed, *j.self, j.nbX0.get(), j.nbX1.get(), j.nbZ0.get(),
+                                               j.nbZ1.get(), verts, j.indices);
+        voronoi::packArrays(verts, j.positions, j.normals, j.uvs);
+        j.built = !verts.empty() && !j.indices.empty();
+    }
+    else
+    {
+        buildChunkMesh(*j.self, j.nbX0.get(), j.nbX1.get(), j.nbZ0.get(), j.nbZ1.get(), j.cubeVerts, j.indices);
+        j.built = !j.cubeVerts.empty();
+    }
+}
+}  // namespace
 
 // =========================================================================
 //  Конструктор / деструктор
@@ -89,6 +142,11 @@ void ChunkManager::shutdown()
         std::lock_guard<std::mutex> lk(_readyMtx);
         _readyChunks.clear();
     }
+    {
+        std::lock_guard<std::mutex> lk(_meshDoneMtx);
+        _meshDone.clear();
+    }
+    _meshInFlight = 0;
     _genPendingSet.clear();
     _unloadQueue.clear();
 
@@ -145,6 +203,21 @@ void ChunkManager::pause()
     // уже готовые данные. Это быстро (создание меша + добавление в сцену).
     // Явная передача флага force=true для обработки оставшихся чанков
     processReadyChunks(true);
+
+    // Шаг 3б: Применяем меши, которые воркеры успели собрать (force: без лимита per-frame).
+    // signalStop() не обрывает очередь — воркеры выбирают её до конца, поэтому к этому
+    // моменту все поставленные задачи сборки уже в _meshDone.
+    processMeshResults(true);
+    // Страховка: задачи, так и не дошедшие до результата, сбрасываем — чанк пересоберётся после resume.
+    for (auto& [k, e] : _chunks)
+    {
+        if (e.meshJob)
+        {
+            cancelMeshJob(e);
+            e.dirty = true;
+        }
+    }
+    _meshInFlight = 0;
 
     // Шаг 4: Очищаем очередь генерации (при resume заполним заново).
     // НЕ очищаем _chunks — это ядро данных.
@@ -211,10 +284,23 @@ void ChunkManager::resume()
 // =========================================================================
 void ChunkManager::workerLoop()
 {
-    ChunkKey key;
-    while (_genQueue.pop(key))
+    TaskQueue::Item item;
+    while (_genQueue.pop(item))
     {
-        auto chunk = std::make_unique<ChunkData>(key);
+        // --- Сборка меша (общая очередь и те же воркеры, что у генерации) ---
+        if (item.mesh)
+        {
+            runMeshJob(*item.mesh);
+            {
+                std::lock_guard<std::mutex> lk(_meshDoneMtx);
+                _meshDone.push_back(std::move(item.mesh));
+            }
+            continue;
+        }
+
+        // --- Генерация чанка ---
+        const ChunkKey key = item.key;
+        auto chunk         = std::make_unique<ChunkData>(key);
         if (_onGenerate)
         {
             _onGenerate(*chunk);
@@ -256,6 +342,7 @@ void ChunkManager::update(const ax::Vec3& playerWorldPos)
     }
 
     processReadyChunks();
+    processMeshResults();
     processDirtyChunks();
     processUnloadQueue();
 
@@ -371,6 +458,7 @@ void ChunkManager::collectChunksToUnload(const ChunkKey& playerChunk)
         if (chunkDistance(key, playerChunk) > unloadDist)
         {
             entry.status = ChunkStatus::QueuedForUnload;
+            cancelMeshJob(entry);  // воркеру незачем собирать меш выгружаемого чанка
             _unloadQueue.push_back(key);
             ++it;
         }
@@ -416,7 +504,7 @@ ax::Node* ChunkManager::buildChunkVisualNode(const ChunkKey& key, ChunkData& dat
         std::vector<voronoi::Vertex> vverts;
         if (!voronoi::buildChunkMesh(key, _cfg.voronoiSeed, data, neighborX0, neighborX1, neighborZ0, neighborZ1,
                                      vverts, inds))
-            AXLOGW("ChunkManager: voronoi mesh truncated at %zu vertices (chunk %d,%d,%d)", vverts.size(), key.x,
+            AXLOGW("ChunkManager: voronoi mesh truncated at {} vertices (chunk {},{},{})", vverts.size(), key.x,
                    key.y, key.z);
         if (vverts.empty())
             return nullptr;
@@ -432,7 +520,14 @@ ax::Node* ChunkManager::buildChunkVisualNode(const ChunkKey& key, ChunkData& dat
     }
     if (!mesh)
         return nullptr;
+    return finishChunkNode(key, mesh);
+}
 
+// =========================================================================
+//  finishChunkNode — нод чанка из готового меша (общая часть sync/async путей)
+// =========================================================================
+ax::Node* ChunkManager::finishChunkNode(const ChunkKey& key, ax::Mesh* mesh)
+{
     //  MeshRenderer — это Node (наследник Node), а НЕ компонент.
     auto* chunkNode = ax::MeshRenderer::create();
     chunkNode->addMesh(mesh);
@@ -602,6 +697,130 @@ ax::Node* ChunkManager::buildWaterVisualNode(const ChunkKey& key, ChunkData& dat
 }
 
 // =========================================================================
+//  cancelMeshJob / scheduleMeshJob / processMeshResults — фоновая сборка мешей
+// =========================================================================
+void ChunkManager::cancelMeshJob(ChunkEntry& entry)
+{
+    if (entry.meshJob)
+    {
+        entry.meshJob->cancelled.store(true, std::memory_order_relaxed);
+        entry.meshJob.reset();  // результат (если придёт) не совпадёт с entry.meshJob → будет отброшен
+    }
+}
+
+bool ChunkManager::scheduleMeshJob(const ChunkKey& key, ChunkEntry& entry)
+{
+    if (_paused || !_cfg.asyncMeshing || !entry.chunkData)
+        return false;
+    if (entry.meshJob)
+        return false;  // уже собирается; dirty (если выставят) сработает после применения результата
+    if (_meshInFlight >= _cfg.maxMeshJobsInFlight)
+        return false;
+
+    auto job     = std::make_shared<MeshJob>();
+    job->key     = key;
+    job->voronoi = _cfg.voronoiTerrain;
+    job->seed    = _cfg.voronoiSeed;
+
+    // Снимок: копия блоков. ~131 КБ на чанк (uint16_t × 16·256·16) — memcpy порядка десятков мкс.
+    job->self = std::make_unique<ChunkData>(*entry.chunkData);
+
+    auto snapshotNeighbor = [&](int dx, int dz) -> std::unique_ptr<ChunkData> {
+        auto nit = _chunks.find(ChunkKey{key.x + dx, key.y, key.z + dz});
+        if (nit != _chunks.end() && nit->second.status == ChunkStatus::Active && nit->second.chunkData)
+            return std::make_unique<ChunkData>(*nit->second.chunkData);
+        return nullptr;
+    };
+    job->nbX0 = snapshotNeighbor(-1, 0);
+    job->nbX1 = snapshotNeighbor(1, 0);
+    job->nbZ0 = snapshotNeighbor(0, -1);
+    job->nbZ1 = snapshotNeighbor(0, 1);
+
+    entry.meshJob = job;
+    entry.dirty   = false;  // любая правка ПОСЛЕ снимка снова выставит флаг
+    ++_meshInFlight;
+
+    _genQueue.pushMesh(std::move(job), key, chunkDistance(key, worldToChunk(_playerWorldPos)));
+    return true;
+}
+
+void ChunkManager::processMeshResults(bool force)
+{
+    if (_paused && !force)
+        return;
+
+    std::vector<std::shared_ptr<MeshJob>> done;
+    {
+        std::lock_guard<std::mutex> lk(_meshDoneMtx);
+        if (_meshDone.empty())
+            return;
+        done.swap(_meshDone);
+    }
+
+    // Воркеры завершаются в произвольном порядке — ближние к игроку применяем первыми.
+    const ChunkKey pc = worldToChunk(_playerWorldPos);
+    std::sort(done.begin(), done.end(), [&](const auto& a, const auto& b) {
+        return chunkDistance(a->key, pc) < chunkDistance(b->key, pc);
+    });
+
+    int applied = 0;
+    for (size_t i = 0; i < done.size(); ++i)
+    {
+        if (!force && applied >= _cfg.maxMeshAppliesPerFrame)
+        {
+            // Остаток вернётся в очередь результатов; слот «в полёте» остаётся занятым до применения.
+            std::lock_guard<std::mutex> lk(_meshDoneMtx);
+            _meshDone.insert(_meshDone.end(), std::make_move_iterator(done.begin() + static_cast<long>(i)),
+                             std::make_move_iterator(done.end()));
+            break;
+        }
+
+        const std::shared_ptr<MeshJob>& job = done[i];
+        --_meshInFlight;
+
+        auto it = _chunks.find(job->key);
+        if (it == _chunks.end() || it->second.meshJob != job)
+            continue;  // чанк выгружен / задача отменена / чанк пересоздан
+        ChunkEntry& e = it->second;
+        e.meshJob.reset();
+        if (job->cancelled.load(std::memory_order_relaxed) || e.status != ChunkStatus::Active || !e.chunkData)
+            continue;
+
+        const ChunkKey& key = job->key;
+
+        // Новый нод (GPU-ресурсы — только здесь, в главном потоке)
+        ax::Mesh* mesh = nullptr;
+        if (job->built)
+        {
+            if (job->truncated)
+                AXLOGW("ChunkManager: voronoi mesh truncated (chunk {},{},{})", key.x, key.y, key.z);
+            mesh = job->voronoi ? voronoi::createMeshFromArrays(job->positions, job->normals, job->uvs, job->indices,
+                                                                _terrainAtlas)
+                                : createMesh(job->cubeVerts, job->indices, _terrainAtlas);
+        }
+        ax::Node* node = mesh ? finishChunkNode(key, mesh) : nullptr;
+
+        // Заменяем старые ноды (старый меш виден до этого момента — без мерцания)
+        if (e.visualNode && _onUnload)
+            _onUnload(e.visualNode, key);
+        e.visualNode = node;
+        if (e.waterNode && _onWaterNodeDestroyed)
+            _onWaterNodeDestroyed(e.waterNode);
+        if (e.waterNode && _onUnload)
+            _onUnload(e.waterNode, key);
+        e.waterNode = buildWaterVisualNode(key, *e.chunkData);  // вода: дешёвый кубический меш, строим синхронно
+
+        if (node && _onVisualize)
+            _onVisualize(node, key);
+        if (e.waterNode && _onVisualize)
+            _onVisualize(e.waterNode, key);
+        if (e.waterNode && _onWaterNodeCreated)
+            _onWaterNodeCreated(e.waterNode);
+        ++applied;
+    }
+}
+
+// =========================================================================
 //  processReadyChunks
 // =========================================================================
 void ChunkManager::processReadyChunks(bool force)
@@ -685,6 +904,27 @@ void ChunkManager::processReadyChunks(bool force)
             }
             continue;
         }
+        if (_cfg.asyncMeshing)
+        {
+            // Меш соберёт воркер: чанк Active сразу (блоки доступны коллизиям), нода появится позже.
+            cancelMeshJob(it->second);  // на случай задачи от прежнего «воплощения» чанка
+            it->second.status     = ChunkStatus::Active;
+            it->second.visualNode = nullptr;
+            it->second.waterNode  = nullptr;
+            _genPendingSet.erase(key);
+            // Не вышло поставить (лимит в полёте) — dirty повторит попытку из processDirtyChunks().
+            it->second.dirty = !scheduleMeshJob(key, it->second);
+            ChunkKey nbKeys[] = {
+                {key.x - 1, key.y, key.z}, {key.x + 1, key.y, key.z}, {key.x, key.y, key.z - 1}, {key.x, key.y, key.z + 1}};
+            for (const auto& nk : nbKeys)
+            {
+                auto nit = _chunks.find(nk);
+                if (nit != _chunks.end() && nit->second.status == ChunkStatus::Active && !nit->second.dirty)
+                    nit->second.dirty = true;
+            }
+            ++processed;
+            continue;
+        }
         ax::Node* chunkNode   = buildChunkVisualNode(key, *it->second.chunkData);
         it->second.visualNode = chunkNode;
         it->second.waterNode  = buildWaterVisualNode(key, *it->second.chunkData);
@@ -736,6 +976,47 @@ void ChunkManager::processDirtyChunks()
                 return true;
         return false;
     };
+
+    if (_cfg.asyncMeshing)
+    {
+        // Кандидаты: dirty, без задачи в полёте, соседи «осели». Ставим ближайшие к игроку.
+        const ChunkKey pc = worldToChunk(_playerWorldPos);
+        std::vector<std::pair<int, ChunkKey>> cands;
+        for (auto& [key, entry] : _chunks)
+        {
+            if (!entry.dirty || entry.status != ChunkStatus::Active || !entry.chunkData || entry.meshJob ||
+                neighborsPending(key))
+                continue;
+            if (entry.chunkData->isAllAir())
+            {
+                // Пустой чанк: геометрии нет — снимаем старые ноды, если были, и гасим флаг.
+                if (entry.visualNode && _onUnload)
+                    _onUnload(entry.visualNode, key);
+                entry.visualNode = nullptr;
+                if (entry.waterNode && _onWaterNodeDestroyed)
+                    _onWaterNodeDestroyed(entry.waterNode);
+                if (entry.waterNode && _onUnload)
+                    _onUnload(entry.waterNode, key);
+                entry.waterNode = nullptr;
+                entry.dirty     = false;
+                continue;
+            }
+            cands.emplace_back(chunkDistance(key, pc), key);
+        }
+        std::sort(cands.begin(), cands.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        int scheduled = 0;
+        for (const auto& [dist, key] : cands)
+        {
+            if (scheduled >= _cfg.maxDirtyRebuildsPerFrame)
+                break;
+            auto it = _chunks.find(key);
+            if (it == _chunks.end() || !scheduleMeshJob(key, it->second))
+                break;  // лимит в полёте/пауза — повторим в следующем кадре
+            ++scheduled;
+        }
+        return;
+    }
 
     std::vector<ChunkKey> dirtyKeys;
     for (auto& [key, entry] : _chunks)
@@ -800,6 +1081,7 @@ void ChunkManager::processUnloadQueue()
                 _onWaterNodeDestroyed(mapIt->second.waterNode);
             if (mapIt->second.waterNode && _onUnload)
                 _onUnload(mapIt->second.waterNode, key);
+            cancelMeshJob(mapIt->second);
             _chunks.erase(mapIt);
             _genPendingSet.erase(key);
             it = _unloadQueue.erase(it);

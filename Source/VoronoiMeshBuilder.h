@@ -344,14 +344,17 @@ inline bool buildChunkMesh(const ChunkKey& key,
     return !truncated;
 }
 
-/// Создаёт ax::Mesh с НАСТОЯЩИМИ нормалями (в отличие от createMesh() для кубов — заглушка).
-inline ax::Mesh* createMesh(const std::vector<Vertex>& vertices, const ax::IndexArray& indices, ax::Texture2D* texture)
+/// Раскладывает вершины в раздельные массивы для ax::Mesh::create. Чистая функция —
+/// вызывается в ВОРКЕРЕ, чтобы в главном потоке остался только вызов Mesh::create.
+inline void packArrays(const std::vector<Vertex>& vertices,
+                       std::vector<float>& positions,
+                       std::vector<float>& normals,
+                       std::vector<float>& uvs)
 {
-    if (vertices.empty() || indices.empty())
-        return nullptr;
-
     const size_t n = vertices.size();
-    std::vector<float> positions(n * 3), normals(n * 3), uvs(n * 2);
+    positions.resize(n * 3);
+    normals.resize(n * 3);
+    uvs.resize(n * 2);
     for (size_t i = 0; i < n; ++i)
     {
         positions[i * 3 + 0] = vertices[i].x;
@@ -363,10 +366,31 @@ inline ax::Mesh* createMesh(const std::vector<Vertex>& vertices, const ax::Index
         uvs[i * 2 + 0]       = vertices[i].u;
         uvs[i * 2 + 1]       = vertices[i].v;
     }
+}
+
+/// Создаёт ax::Mesh из готовых массивов (ТОЛЬКО главный поток: аллоцирует GPU-буферы).
+inline ax::Mesh* createMeshFromArrays(const std::vector<float>& positions,
+                                      const std::vector<float>& normals,
+                                      const std::vector<float>& uvs,
+                                      const ax::IndexArray& indices,
+                                      ax::Texture2D* texture)
+{
+    if (positions.empty() || indices.empty())
+        return nullptr;
     auto* mesh = ax::Mesh::create(positions, normals, uvs, indices);
     if (mesh && texture)
         mesh->setTexture(texture);
     return mesh;
+}
+
+/// Создаёт ax::Mesh с НАСТОЯЩИМИ нормалями (в отличие от createMesh() для кубов — заглушка).
+inline ax::Mesh* createMesh(const std::vector<Vertex>& vertices, const ax::IndexArray& indices, ax::Texture2D* texture)
+{
+    if (vertices.empty() || indices.empty())
+        return nullptr;
+    std::vector<float> positions, normals, uvs;
+    packArrays(vertices, positions, normals, uvs);
+    return createMeshFromArrays(positions, normals, uvs, indices, texture);
 }
 
 }  // namespace voronoi
