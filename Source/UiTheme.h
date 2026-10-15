@@ -40,24 +40,24 @@ inline void applyStyle()
     s.ItemSpacing      = ImVec2(14.0f, 12.0f);
     s.WindowTitleAlign = ImVec2(0.5f, 0.5f);
 
-    ImVec4* c                     = s.Colors;
-    c[ImGuiCol_Text]              = ImVec4(0.92f, 0.94f, 0.97f, 1.00f);
-    c[ImGuiCol_TextDisabled]      = ImVec4(0.45f, 0.48f, 0.54f, 1.00f);
-    c[ImGuiCol_WindowBg]          = ImVec4(0.05f, 0.06f, 0.09f, 0.88f);  // полупрозрачная панель
-    c[ImGuiCol_ChildBg]           = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    c[ImGuiCol_Border]            = ImVec4(1.00f, 1.00f, 1.00f, 0.06f);
-    c[ImGuiCol_FrameBg]           = ImVec4(0.13f, 0.15f, 0.20f, 0.85f);
-    c[ImGuiCol_FrameBgHovered]    = ImVec4(0.18f, 0.21f, 0.28f, 0.90f);
-    c[ImGuiCol_FrameBgActive]     = ImVec4(0.20f, 0.24f, 0.32f, 1.00f);
-    c[ImGuiCol_Button]            = ImVec4(1.00f, 1.00f, 1.00f, 0.04f);  // почти невидимая кнопка
-    c[ImGuiCol_ButtonHovered]     = kAccent;
-    c[ImGuiCol_ButtonActive]      = ImVec4(0.18f, 0.44f, 0.80f, 1.00f);
-    c[ImGuiCol_SliderGrab]        = kAccent;
-    c[ImGuiCol_SliderGrabActive]  = kAccentHover;
-    c[ImGuiCol_CheckMark]         = kAccentHover;
-    c[ImGuiCol_Header]            = ImVec4(0.18f, 0.21f, 0.28f, 0.80f);
-    c[ImGuiCol_HeaderHovered]     = kAccent;
-    c[ImGuiCol_HeaderActive]      = kAccentHover;
+    ImVec4* c                    = s.Colors;
+    c[ImGuiCol_Text]             = ImVec4(0.92f, 0.94f, 0.97f, 1.00f);
+    c[ImGuiCol_TextDisabled]     = ImVec4(0.45f, 0.48f, 0.54f, 1.00f);
+    c[ImGuiCol_WindowBg]         = ImVec4(0.05f, 0.06f, 0.09f, 0.88f);  // полупрозрачная панель
+    c[ImGuiCol_ChildBg]          = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    c[ImGuiCol_Border]           = ImVec4(1.00f, 1.00f, 1.00f, 0.06f);
+    c[ImGuiCol_FrameBg]          = ImVec4(0.13f, 0.15f, 0.20f, 0.85f);
+    c[ImGuiCol_FrameBgHovered]   = ImVec4(0.18f, 0.21f, 0.28f, 0.90f);
+    c[ImGuiCol_FrameBgActive]    = ImVec4(0.20f, 0.24f, 0.32f, 1.00f);
+    c[ImGuiCol_Button]           = ImVec4(1.00f, 1.00f, 1.00f, 0.04f);  // почти невидимая кнопка
+    c[ImGuiCol_ButtonHovered]    = kAccent;
+    c[ImGuiCol_ButtonActive]     = ImVec4(0.18f, 0.44f, 0.80f, 1.00f);
+    c[ImGuiCol_SliderGrab]       = kAccent;
+    c[ImGuiCol_SliderGrabActive] = kAccentHover;
+    c[ImGuiCol_CheckMark]        = kAccentHover;
+    c[ImGuiCol_Header]           = ImVec4(0.18f, 0.21f, 0.28f, 0.80f);
+    c[ImGuiCol_HeaderHovered]    = kAccent;
+    c[ImGuiCol_HeaderActive]     = kAccentHover;
 }
 
 /**
@@ -80,8 +80,14 @@ inline void setup()
     auto* presenter = extension::ImGuiPresenter::getInstance();
 
     auto designSize = Director::getInstance()->getRenderView()->getDesignResolutionSize();
+#if (AX_TARGET_PLATFORM == AX_PLATFORM_ANDROID)
     presenter->setViewResolution(designSize.width, designSize.height);
+#endif
     presenter->enableDPIScale();
+
+    // отключаем Viewports, чтобы не было «плавающих» окон вне игрового окна
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags &= ~ImGuiConfigFlags_ViewportsEnable;
 
     // arial.ttf содержит кириллицу — глифы растеризуются по требованию (ImGui 1.92).
     auto fontPath = FileUtils::getInstance()->fullPathForFilename("fonts/arial.ttf");
@@ -94,9 +100,9 @@ inline void setup()
 /// @brief Рисует горизонтально центрированный по текущему окну текст.
 inline void textCentered(const char* text)
 {
-    float avail    = ImGui::GetContentRegionAvail().x;
-    float textW    = ImGui::CalcTextSize(text).x;
-    float offset   = (avail - textW) * 0.5f;
+    float avail  = ImGui::GetContentRegionAvail().x;
+    float textW  = ImGui::CalcTextSize(text).x;
+    float offset = (avail - textW) * 0.5f;
     if (offset > 0.0f)
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + offset);
     ImGui::TextUnformatted(text);
