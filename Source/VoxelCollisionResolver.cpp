@@ -156,11 +156,14 @@ void VoxelCollisionResolver::sweepAxis(float dt,
 
         if (checkCollisionAt(testPos))
         {
-            // --- Подъём на ступеньку (только по горизонтали, стоя на земле) ---
+            // --- Подъём на ступеньку (только по горизонтали) ---
             // Сканируем высоту от STEP_UP_HEIGHT вниз: ищем наибольшую h, при которой
-            // тело свободно, а на h - STEP_UP_PROBE уже коллизия — ставим ногу ровно
-            // на верх препятствия (без «зависания» в воздухе до кадра гравитации).
-            if (axis != 1 && grounded && !steppedUp)
+            // тело свободно, а на h - STEP_UP_PROBE уже коллизия — определяем высоту
+            // верха препятствия над текущей подошвой (оставшуюся высоту подъёма).
+            // Условие grounded || velocity.y > 0: подъём продолжается, пока капсула
+            // уже взбирается (скорость поддерживается каждым кадром повторного
+            // столкновения), но не запускается «с лету» при падении вдоль стены.
+            if (axis != 1 && (grounded || velocity.y > 0.0f) && !steppedUp)
             {
                 float stepY = -1.0f;
                 for (float h = STEP_UP_HEIGHT; h > 0.0f; h -= STEP_UP_PROBE)
@@ -171,9 +174,18 @@ void VoxelCollisionResolver::sweepAxis(float dt,
                 }
                 if (stepY > 0.0f)
                 {
-                    outResult.resolvedPosition = testPos + ax::Vec3(0.0f, stepY, 0.0f);
-                    steppedUp                  = true;
-                    continue;  // Шаг принят: поднялись на ступеньку, продолжаем движение
+                    // Плавный подъём («желе»): позицию НЕ меняем — сообщаем контроллеру
+                    // оставшуюся высоту, он задаст вертикальную скорость, и капсула
+                    // взойдёт на ступеньку за несколько кадров (как мини-прыжок).
+                    outResult.stepUp       = true;
+                    outResult.stepUpHeight = stepY;
+                    steppedUp              = true;
+
+                    // Горизонталь по-прежнему заблокирована до конца подъёма
+                    float sign = (moveDelta > 0.0f) ? 1.0f : -1.0f;
+                    outResult.collisionNormal =
+                        ax::Vec3(axis == 0 ? sign : 0, axis == 1 ? sign : 0, axis == 2 ? sign : 0);
+                    return;
                 }
             }
 
