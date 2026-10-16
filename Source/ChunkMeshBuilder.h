@@ -87,7 +87,9 @@ inline std::array<float, 4> calculateBlockUV(uint16_t blockId, int atlasSize = 4
 
 // Возвращает индекс тайла в атласе для конкретной грани блока
 // face: 0=+X, 1=-X, 2=+Y(top), 3=-Y(bottom), 4=+Z, 5=-Z
-// Atlas 4x4 layout (first row): 0=Grass, 1=Grass with dirt, 2=Dirt, 3=Stone
+// Atlas 4x4 layout: 0=Grass, 1=Grass with dirt, 2=Dirt, 3=Stone, 4=Water,
+//                   5=Sand, 6=Gravel, 7=Coal, 8=Iron, 9=Gold, 10=Crystal
+// (совпадает с texgen::Tile в TextureFactory.h)
 inline uint16_t getBlockTileIndex(uint16_t blockId, int face)
 {
     switch (blockId)
@@ -111,6 +113,18 @@ inline uint16_t getBlockTileIndex(uint16_t blockId, int face)
         return 3;  // stone texture on all faces
     case BLOCK_DIRT:
         return 2;  // dirt texture on all faces
+    case BLOCK_SAND:
+        return 5;  // песок на всех гранях
+    case BLOCK_GRAVEL:
+        return 6;  // гравий на всех гранях
+    case BLOCK_COAL_ORE:
+        return 7;  // угольная руда
+    case BLOCK_IRON_ORE:
+        return 8;  // железная руда
+    case BLOCK_GOLD_ORE:
+        return 9;  // золотая руда
+    case BLOCK_CRYSTAL_ORE:
+        return 10;  // кристаллическая руда
     default:
         return 0;  // fallback: use grass tile
     }

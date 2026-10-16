@@ -4,7 +4,10 @@
  */
 
 #include "VoxelRaycaster.h"
-#include "ChunkMeshBuilder.h"  // Для ChunkVertex, buildChunkMesh, createMesh
+#include "ChunkMeshBuilder.h"    // Для ChunkVertex, buildChunkMesh, createMesh
+#include "VoronoiMeshBuilder.h"  // voronoi::buildBlockFace — прицел по реальной грани
+#include "renderer/backend/ProgramManager.h"
+#include "renderer/backend/ProgramState.h"
 
 USING_NS_AX;
 
@@ -99,6 +102,32 @@ bool VoxelRaycasterNode::init(ax::Camera* camera, ChunkManager* mgr, float maxDi
     setupCachedRenderer(_breakProgressRenderer);
     _renderersInitialized = true;
 
+    // ============================================================================
+    //  Шейдер прицела по реальной грани (custom/highlight_*).
+    //  Вершины buildBlockFace запекаются в МИРОВЫХ координатах → u_chunkOrigin = 0,
+    //  тогда хэши узлов дрожания в шейдере совпадают с террейном бит-в-бит.
+    //  u_time и u_tintColor тикаются каждый кадр в update() (tickShaderUniforms).
+    // ============================================================================
+    if (_mgr->isVoronoiTerrain())
+    {
+        if (auto* program = ax::ProgramManager::getInstance()->loadProgram(
+                "custom/highlight_vs", "custom/highlight_fs", ax::backend::VertexLayoutType::Unspec))
+        {
+            _highlightPS = new ax::backend::ProgramState(program);
+            _breakPS     = new ax::backend::ProgramState(program);
+            const ax::Vec3 zero = ax::Vec3::ZERO;
+            for (auto* ps : {_highlightPS, _breakPS})
+            {
+                if (auto loc = ps->getUniformLocation("u_chunkOrigin"))
+                    ps->setUniform(loc, &zero, sizeof(ax::Vec3));
+            }
+        }
+        else
+        {
+            AXLOGW("[VoxelRaycaster] custom/highlight_* не собран — прицел откатится на сеточный квад");
+        }
+    }
+
     return true;
 }
 
@@ -125,6 +154,11 @@ void VoxelRaycasterNode::update(float dt)
 {
     if (!_camera || !_mgr)
         return;
+
+    // Часы анимации прицела: тот же dt, что накапливает GameScene для террейна,
+    // поэтому дрожание желе/покачивание травы у подсветки синхронно с гранью.
+    _animTime += dt;
+    tickShaderUniforms();
 
     Vec3 eye;
     _camera->getNodeToWorldTransform().getTranslation(&eye);
@@ -430,6 +464,63 @@ void VoxelRaycasterNode::cleanupParticles()
 }
 
 // ============================================================================
+//  Тик uniform'ов шейдера прицела (u_time + u_tintColor)
+// ============================================================================
+
+void VoxelRaycasterNode::tickShaderUniforms()
+{
+    auto tick = [this](ax::backend::ProgramState* ps, const ax::Color4F& color) {
+        if (!ps)
+            return;
+        if (auto loc = ps->getUniformLocation("u_time"))
+            ps->setUniform(loc, &_animTime, sizeof(float));
+        if (auto loc = ps->getUniformLocation("u_tintColor"))
+            ps->setUniform(loc, &color, sizeof(ax::Color4F));
+    };
+    tick(_highlightPS, _faceColor);
+    tick(_breakPS, _breakColor);
+}
+
+// ============================================================================
+//  Прицел по реальной грани: общий хелпер воронои-пути
+// ============================================================================
+//
+//  Строит полигон видимой грани (ячейка Вороного + желейное смещение) в мировых
+//  координатах. Возвращает nullptr, если воронои-режим выключен, шейдер не собран
+//  или грань не существует — вызывающий код откатывается на сеточный квад.
+ax::Mesh* VoxelRaycasterNode::createVoronoiFaceMesh(const VoxelHit& hit, float pushOut, float insetScale)
+{
+    if (!_mgr || !_mgr->isVoronoiTerrain() || !_highlightPS)
+        return nullptr;
+    if (hit.normal == Vec3::ZERO)
+        return nullptr;
+
+    std::vector<voronoi::Vertex> vverts;
+    ax::IndexArray vind(ax::backend::IndexFormat::U_INT);
+
+    // Акцессор блоков по целым мировым координатам (через потокобезопасный API менеджера).
+    // ВАЖНО: повторяем допущения buildChunkMesh — диагональные чанки и чанки выше/ниже
+    // считаются воздухом, иначе желейное смещение угловых колонок разъедется с мешем.
+    const ChunkKey hitChunk = ChunkManager::worldToChunk(Vec3{static_cast<float>(hit.bx) + 0.5f,
+                                                              static_cast<float>(hit.by) + 0.5f,
+                                                              static_cast<float>(hit.bz) + 0.5f});
+    auto blockAtWorld = [this, hitChunk](int x, int y, int z) -> BlockId {
+        const Vec3 p{static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f, static_cast<float>(z) + 0.5f};
+        const ChunkKey k = ChunkManager::worldToChunk(p);
+        if (k.y != hitChunk.y || (k.x != hitChunk.x && k.z != hitChunk.z))
+            return BLOCK_AIR;  // как blockAt() билдера: вне чанка и 4 боковых соседей — воздух
+        return _mgr->getBlockAtWorldPos(p);
+    };
+
+    if (!voronoi::buildBlockFace(_mgr->getBiomeConfig(), blockAtWorld, hit.bx, hit.by, hit.bz,
+                                 static_cast<int>(hit.normal.x), static_cast<int>(hit.normal.y),
+                                 static_cast<int>(hit.normal.z), pushOut, insetScale, vverts, vind))
+        return nullptr;
+
+    return voronoi::createMesh(vverts, vind, _terrainAtlas);
+}
+
+// ============================================================================
 //  Меш-билдинг: highlight грани (тонкий блок со смещением)
 // ============================================================================
 
@@ -437,6 +528,14 @@ ax::Mesh* VoxelRaycasterNode::createFaceHighlightMesh(const VoxelHit& hit)
 {
     if (hit.normal == Vec3::ZERO)
         return nullptr;
+
+    // Воронои-путь: точный полигон видимой грани (+0.004 по нормали против z-fighting)
+    if (auto* mesh = createVoronoiFaceMesh(hit, 0.004f, 1.0f))
+    {
+        _faceMeshIsVoronoi = true;
+        return mesh;
+    }
+    _faceMeshIsVoronoi = false;  // откат на сеточный квад (UNLIT, без кастомного шейдера)
 
     Vec3 offset(static_cast<float>(hit.bx) + hit.normal.x * 0.002f, static_cast<float>(hit.by) + hit.normal.y * 0.002f,
                 static_cast<float>(hit.bz) + hit.normal.z * 0.002f);
@@ -555,6 +654,15 @@ ax::Mesh* VoxelRaycasterNode::createBreakProgressMesh(const VoxelHit& hit, float
     if (progress <= 0.0f)
         return nullptr;
 
+    // Воронои-путь: реальная грань, сжатая к центроиду пропорционально прогрессу
+    // (+0.006 по нормали — выше подсветки, чтобы не слипаться с ней)
+    if (auto* mesh = createVoronoiFaceMesh(hit, 0.006f, progress))
+    {
+        _breakMeshIsVoronoi = true;
+        return mesh;
+    }
+    _breakMeshIsVoronoi = false;
+
     Vec3 center(static_cast<float>(hit.bx) + 0.5f + hit.normal.x * 0.003f,
                 static_cast<float>(hit.by) + 0.5f + hit.normal.y * 0.003f,
                 static_cast<float>(hit.bz) + 0.5f + hit.normal.z * 0.003f);
@@ -639,6 +747,11 @@ void VoxelRaycasterNode::updateFaceHighlight(const VoxelHit& hit)
         // Если вызвать setMaterial() до addMesh(), массив _meshes пуст и вызов будет no-op.
         if (_highlightMaterial)
             _faceHighlightRenderer->setMaterial(_highlightMaterial);
+        // Шейдер прицела поверх материала (render-state сохраняется, как у чанков).
+        // Только для воронои-меша: у сеточного квада (ChunkVertex) нет атрибутов
+        // a_texCoord1/2 — он остаётся на встроенном UNLIT.
+        if (_highlightPS && _faceMeshIsVoronoi)
+            _faceHighlightRenderer->setProgramState(_highlightPS);
 
         _faceHighlightRenderer->setVisible(true);  // Показываем ноду
 
@@ -697,6 +810,9 @@ void VoxelRaycasterNode::updateBreakProgress(const VoxelHit& hit)
         _breakProgressRenderer->addMesh(mesh);
         if (_breakMaterial)
             _breakProgressRenderer->setMaterial(_breakMaterial);
+        // Воронои-меш прогресса — тем же шейдером прицела (синхронная анимация)
+        if (_breakPS && _breakMeshIsVoronoi)
+            _breakProgressRenderer->setProgramState(_breakPS);
         _breakProgressRenderer->setVisible(true);
 
         _breakProgressRenderer->setColor(ax::Color3B(static_cast<uint8_t>(_breakColor.r * 255),
@@ -830,4 +946,7 @@ VoxelRaycasterNode::~VoxelRaycasterNode()
     AX_SAFE_RELEASE_NULL(_highlightMaterial);
     AX_SAFE_RELEASE_NULL(_previewMaterial);
     AX_SAFE_RELEASE_NULL(_breakMaterial);
+    // ProgramState шейдера прицела — тоже retain'ились в init()
+    AX_SAFE_RELEASE_NULL(_highlightPS);
+    AX_SAFE_RELEASE_NULL(_breakPS);
 }

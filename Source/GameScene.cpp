@@ -3,6 +3,7 @@
 #include "SaveGameService.h"
 #include "UiTheme.h"
 #include "PerlinNoise.hpp"
+#include "WorldGenerator.h"
 #include <algorithm>
 #include <thread>
 #include <climits>
@@ -16,6 +17,8 @@ namespace
 constexpr const char* kKeyRenderDistance = "settings.renderDistance";
 constexpr const char* kKeyMouseSens      = "settings.mouseSensitivity";
 constexpr const char* kKeyPixelArtAA     = "settings.pixelArtAA";
+constexpr const char* kKeyTilePixelate   = "settings.tilePixelate";
+constexpr const char* kKeyTilePixelRes   = "settings.tilePixelRes";
 /// @}
 }  // namespace
 
@@ -102,12 +105,12 @@ bool GameScene::init()
 
     // Конфигурация чанков
     ChunkManager::Config cfg;
-    cfg.renderDistance         = userRenderDist;
-    cfg.unloadMargin           = 3;
-    cfg.workerThreadCount      = std::max(1u, std::thread::hardware_concurrency() / 2);
-    cfg.maxGenerationsPerFrame = 2;
-    cfg.maxUnloadsPerFrame     = 4;
-    cfg.maxQueueSize           = 128;
+    cfg.renderDistance           = userRenderDist;
+    cfg.unloadMargin             = 3;
+    cfg.workerThreadCount        = std::max(1u, std::thread::hardware_concurrency() / 2);
+    cfg.maxGenerationsPerFrame   = 2;
+    cfg.maxUnloadsPerFrame       = 4;
+    cfg.maxQueueSize             = 128;
     // Подняли с 2 до 4: после фиксов мешинга (реалистичный reserve + обрезка по Y)
     // и отложенной перестройки до «оседания» соседей каждый ребилд стал заметно
     // дешевле и реже, поэтому осевшую пачку чанков можно разгребать быстрее.
@@ -115,78 +118,20 @@ bool GameScene::init()
     // Кастомный шейдер террейна: antialiased pixel art (резко вблизи, без дрожания
     // вдали). Атлас при этом грузится с LINEAR_MIPMAP_LINEAR. Управляется из меню
     // паузы и сохраняется в UserDefault (по умолчанию включён).
-    cfg.pixelArtAA       = ud->getBoolForKey(kKeyPixelArtAA, true);
-
+    cfg.pixelArtAA               = ud->getBoolForKey(kKeyPixelArtAA, true);
+    // Пикселизация тайлов: uniform-переключатель «на лету» (клавиша P / меню паузы),
+    // без ребилда мешей и перегенерации атласа. Настройка сохраняется.
+    cfg.pixelateTiles            = ud->getBoolForKey(kKeyTilePixelate, false);
+    cfg.tilePixelRes             = std::clamp(ud->getFloatForKey(kKeyTilePixelRes, 32.0f), 4.0f, 128.0f);
+ 
     cfg.biomes.frequency     = {0.40f, 0.20f, 0.40f, 0.0f, 0.0f};
     cfg.biomes.macroCellSize = 64;
     cfg.biomes.blendWidth    = 16;
+	_chunkMgr.init(cfg);
 
-    _chunkMgr.init(cfg);
-
-    // Генерация мира
-    _chunkMgr.setOnGenerate([](ChunkData& chunk) {
-        // Уровень моря вынесен в начало лямбды для использования в обоих циклах
-        constexpr int SEA_LEVEL = 38;
-
-        const ChunkKey& key = chunk.getKey();
-        auto basePos        = ChunkManager::chunkToWorld(key);
-
-        thread_local siv::PerlinNoise perlin(42);
-        thread_local siv::PerlinNoise rockNoise(137);
-        thread_local siv::PerlinNoise dirtNoise(271);
-
-        for (int x = 0; x < CHUNK_SIZE_X; ++x)
-            for (int z = 0; z < CHUNK_SIZE_Z; ++z)
-            {
-                float wx      = basePos.x + x;
-                float wz      = basePos.z + z;
-                float terrain = perlin.octave2D_01(wx * 0.02, wz * 0.02, 6) * 40.0f;
-                float biome   = perlin.octave2D_01(wx * 0.005, wz * 0.005, 4) * 15.0f - 5.0f;
-                int surfaceY  = std::clamp(static_cast<int>(terrain + biome + 30), 1, CHUNK_SIZE_Y - 2);
-
-                float rockVal = rockNoise.octave2D_01(wx * 0.08, wz * 0.08, 3);
-                float dirtVal = dirtNoise.octave2D_01(wx * 0.06, wz * 0.06, 2);
-
-                for (int y = 0; y <= surfaceY; ++y)
-                {
-                    BlockId block;
-                    if (y == surfaceY)
-                    {
-                        /**
-                         * @brief Выбор блока для поверхности террейна
-                         * @details Приоритет: Камень → Водонепроницаемая земля → Земляная кора → Трава
-                         *          Если поверхность ниже SEA_LEVEL, трава не генерируется,
-                         *          так как в природе она распространяется только при контакте с воздухом.
-                         */
-                        if (rockVal > 0.72f)
-                            block = BLOCK_STONE;  // Каменные выступы (игнорирует уровень воды)
-                        else if (surfaceY < SEA_LEVEL)
-                            block = BLOCK_DIRT;  // [FIX #12] Под водой — только земля/камень
-                        else if (dirtVal > 0.65f)
-                            block = BLOCK_DIRT;  // Земляная корка на суше
-                        else
-                            block = BLOCK_GRASS;  // Стандартная трава (только выше уровня моря)
-                    }
-                    else if (y > surfaceY - 4)
-                    {
-                        block = BLOCK_DIRT;  // Верхний слой грунта (4 блока под поверхностью)
-                    }
-                    else
-                    {
-                        block = BLOCK_STONE;  // Глубинный камень
-                    }
-
-                    chunk.setBlock(x, y, z, block);
-                }
-
-                // Заполняем воду от поверхности террейна до уровня моря
-                if (surfaceY < SEA_LEVEL)
-                {
-                    for (int y = surfaceY + 1; y <= SEA_LEVEL; ++y)
-                        chunk.setBlock(x, y, z, BLOCK_WATER);
-                }
-            }
-    });
+    // Генерация мира — общий генератор (WorldGenerator.h): рельеф, пляжи,
+    // гравийные пятна и рудные жилы по глубине. Используется и в главном меню.
+    _chunkMgr.setOnGenerate([](ChunkData& chunk) { worldgen::generate(chunk); });
 
     // CameraFlag — маска USER1 на визуализируемые ноды
     _chunkMgr.setOnVisualize([this](ax::Node* node, const ChunkKey& key) {
@@ -401,6 +346,10 @@ void GameScene::update(float dt)
 
     const ax::Vec3 camWorld = _mainCamera ? _mainCamera->getPosition3D() : ax::Vec3::ZERO;
 
+    // Пикселизация тайлов: uniform-only (0 = выкл), переключается на лету —
+    // общий переключатель для террейна и воды.
+    const float tilePx = _chunkMgr.isTilePixelate() ? _chunkMgr.getTilePixelRes() : 0.0f;
+
     for (auto* node : _waterNodes)
     {
         if (!node)
@@ -418,12 +367,16 @@ void GameScene::update(float dt)
             auto locCam  = ps->getUniformLocation("u_camWorld");
             ps->setUniform(locTime, &_animTime, sizeof(float));
             ps->setUniform(locCam, &camWorld, sizeof(ax::Vec3));
+            auto locPx = ps->getUniformLocation("u_tilePx");
+            if (locPx)
+                ps->setUniform(locPx, &tilePx, sizeof(float));
         }
     }
 
     // === Дрожание желе: те же часы анимации уходят в шейдер террейна ===
     // Смещение считается в вершинном шейдере по мировым координатам (маска
     // запечена в вершинах), поэтому здесь только тикаем u_time для каждого нода.
+    // u_camWorld нужен фрагментнику для френеля желе-шиммера.
     for (auto* node : _terrainNodes)
     {
         if (!node)
@@ -436,6 +389,12 @@ void GameScene::update(float dt)
             auto locTime = ps->getUniformLocation("u_time");
             if (locTime)
                 ps->setUniform(locTime, &_animTime, sizeof(float));
+            auto locCam = ps->getUniformLocation("u_camWorld");
+            if (locCam)
+                ps->setUniform(locCam, &camWorld, sizeof(ax::Vec3));
+            auto locPx = ps->getUniformLocation("u_tilePx");
+            if (locPx)
+                ps->setUniform(locPx, &tilePx, sizeof(float));
         }
     }
 
@@ -512,6 +471,25 @@ void GameScene::setPixelArtAA(bool enabled)
 }
 
 // =========================================================================
+//  setTilePixelate / setTilePixelRes — пикселизация тайлов (вживую + сохранение)
+// =========================================================================
+void GameScene::setTilePixelate(bool enabled)
+{
+    _chunkMgr.setTilePixelate(enabled);  // uniform-only: без ребилда мешей, мгновенно
+    auto* ud = ax::UserDefault::getInstance();
+    ud->setBoolForKey(kKeyTilePixelate, enabled);
+    ud->flush();
+}
+
+void GameScene::setTilePixelRes(float px)
+{
+    _chunkMgr.setTilePixelRes(px);
+    auto* ud = ax::UserDefault::getInstance();
+    ud->setFloatForKey(kKeyTilePixelRes, _chunkMgr.getTilePixelRes());
+    ud->flush();
+}
+
+// =========================================================================
 //  onKeyPressed
 // =========================================================================
 void GameScene::onKeyPressed(ax::EventKeyboard::KeyCode keyCode, ax::Event* event)
@@ -532,4 +510,8 @@ void GameScene::onKeyPressed(ax::EventKeyboard::KeyCode keyCode, ax::Event* even
         auto scene = GameScene::create();
         ax::Director::getInstance()->replaceScene(scene);
     }
+
+    // P — пикселизация тайлов на лету (ретро-режим). Живое применение + сохранение.
+    if (keyCode == ax::EventKeyboard::KeyCode::KEY_P)
+        setTilePixelate(!_chunkMgr.isTilePixelate());
 }

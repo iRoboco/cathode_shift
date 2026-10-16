@@ -14,6 +14,10 @@ constexpr std::string_view kPauseLoopId = "#paus";
 
 /// @brief Ключ настройки pixel-art AA (общий с GameScene/MainMenuScene).
 constexpr const char* kKeyPixelArtAA = "settings.pixelArtAA";
+
+/// @brief Ключи настройки пикселизации тайлов (общие с GameScene/MainMenuScene).
+constexpr const char* kKeyTilePixelate = "settings.tilePixelate";
+constexpr const char* kKeyTilePixelRes = "settings.tilePixelRes";
 }  // namespace
 
 PauseOverlay* PauseOverlay::create(GameScene* owner)
@@ -82,6 +86,21 @@ void PauseOverlay::onDrawPauseMenu()
         bool aa = UserDefault::getInstance()->getBoolForKey(kKeyPixelArtAA, true);
         if (ImGui::Checkbox("Сглаживание пикселей (AA)", &aa) && _owner)
             _owner->setPixelArtAA(aa);  // живое применение + сохранение
+    }
+
+    // --- Графика: пикселизация тайлов (ретро-режим), применяется вживую ---
+    // Uniform-only: переключение мгновенное, без ребилда чанков. В игре та же
+    // функция на клавише P.
+    {
+        bool px = UserDefault::getInstance()->getBoolForKey(kKeyTilePixelate, false);
+        if (ImGui::Checkbox("Пикселизация тайлов (ретро)", &px) && _owner)
+            _owner->setTilePixelate(px);  // живое применение + сохранение
+        if (px)
+        {
+            int res = static_cast<int>(UserDefault::getInstance()->getFloatForKey(kKeyTilePixelRes, 32.0f));
+            if (ImGui::SliderInt("Разрешение тайлов", &res, 8, 64) && _owner)
+                _owner->setTilePixelRes(static_cast<float>(res));
+        }
     }
     ImGui::Dummy(ImVec2(0.0f, 12.0f));
 

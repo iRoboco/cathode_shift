@@ -554,6 +554,24 @@ void FirstPersonController::onKeyPressed(ax::EventKeyboard::KeyCode code, ax::Ev
     case ax::EventKeyboard::KeyCode::KEY_3:
         _selectedBlockId = BLOCK_GRASS;
         break;
+    case ax::EventKeyboard::KeyCode::KEY_4:
+        _selectedBlockId = BLOCK_SAND;
+        break;
+    case ax::EventKeyboard::KeyCode::KEY_5:
+        _selectedBlockId = BLOCK_GRAVEL;
+        break;
+    case ax::EventKeyboard::KeyCode::KEY_6:
+        _selectedBlockId = BLOCK_COAL_ORE;
+        break;
+    case ax::EventKeyboard::KeyCode::KEY_7:
+        _selectedBlockId = BLOCK_IRON_ORE;
+        break;
+    case ax::EventKeyboard::KeyCode::KEY_8:
+        _selectedBlockId = BLOCK_GOLD_ORE;
+        break;
+    case ax::EventKeyboard::KeyCode::KEY_9:
+        _selectedBlockId = BLOCK_CRYSTAL_ORE;
+        break;
     default:
         break;
     }

@@ -1,6 +1,7 @@
 #include "ChunkManager.h"
 #include "ChunkMeshBuilder.h"
 #include "VoronoiMeshBuilder.h"
+#include "TextureFactory.h"
 #include "PerlinNoise.hpp"
 #include "renderer/backend/ProgramManager.h"
 #include "renderer/backend/ProgramState.h"
@@ -83,7 +84,10 @@ void ChunkManager::init(const Config& cfg)
 
     _genQueue.maxSize = static_cast<size_t>(_cfg.maxQueueSize);
 
-    _terrainAtlas = ax::Director::getInstance()->getTextureCache()->addImage("textures/terrain_atlas.png");
+    // Атлас террейна: процедурная генерация из сида (TextureFactory.h) или прежний PNG.
+    _terrainAtlas = _cfg.proceduralTextures
+                        ? texgen::createTerrainAtlas(_cfg.textureSeed)
+                        : ax::Director::getInstance()->getTextureCache()->addImage("textures/terrain_atlas.png");
 
     if (!_terrainAtlas)
     {
@@ -256,7 +260,9 @@ void ChunkManager::resume()
     // текстура станет невалидной. Пересоздаём из кэша.
     if (!_terrainAtlas || _terrainAtlas->getPixelsWide() <= 0)
     {
-        _terrainAtlas = ax::Director::getInstance()->getTextureCache()->addImage("textures/terrain_atlas.png");
+        _terrainAtlas = _cfg.proceduralTextures
+                            ? texgen::createTerrainAtlas(_cfg.textureSeed)
+                            : ax::Director::getInstance()->getTextureCache()->addImage("textures/terrain_atlas.png");
         applyTextureFilter();
         // Общий водный материал держит старую (невалидную) текстуру → сбрасываем,
         // чтобы getOrCreateWaterMaterial пересоздал его с новым атласом.

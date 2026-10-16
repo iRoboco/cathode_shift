@@ -100,6 +100,14 @@ static constexpr BlockId BLOCK_STONE = 2;  ///< Каменный блок
 static constexpr BlockId BLOCK_DIRT  = 3;  ///< Блок земли
 static constexpr BlockId BLOCK_WATER = 4;  ///< Блок воды
 
+// --- Расширенные материалы (процедурный атлас, TextureFactory.h) ---
+static constexpr BlockId BLOCK_SAND        = 5;   ///< Песок (пляжи и дно у воды)
+static constexpr BlockId BLOCK_GRAVEL      = 6;   ///< Гравий (пятна на суше, жилы в глубине)
+static constexpr BlockId BLOCK_COAL_ORE    = 7;   ///< Угольная руда (любая глубина)
+static constexpr BlockId BLOCK_IRON_ORE    = 8;   ///< Железная руда (y <= 40)
+static constexpr BlockId BLOCK_GOLD_ORE    = 9;   ///< Золотая руда (y <= 24)
+static constexpr BlockId BLOCK_CRYSTAL_ORE = 10;  ///< Кристаллическая руда (y <= 16)
+
 /// @brief Уникальный тег для идентификации водных нодов в коллбеках визуализации
 static constexpr int WATER_NODE_TAG = 0x574154;  // ASCII 'WAT'
 
@@ -300,6 +308,24 @@ public:
         /// только тип блока. Вода остаётся кубической. Коллизии/рейкаст пока по сетке.
         bool voronoiTerrain = true;
 
+        /// @brief Процедурный атлас террейна (TextureFactory.h): текстуры генерируются
+        /// из textureSeed на лету, PNG не загружается. false → прежний Content/textures/terrain_atlas.png.
+        bool proceduralTextures = true;
+
+        /// @brief Сид процедурного атласа. Привяжите к сиду мира: узор стабилен между запусками.
+        uint32_t textureSeed = 1337;
+
+        /// @brief Пикселизация тайлов («занижение» разрешения атласа в шейдерах
+        /// voronoi_terrain и water). Реализовано uniform'ом u_tilePx: квантование UV
+        /// во фрагментнике, поэтому включается/выключается НА ЛЕТУ — без перегенерации
+        /// атласа и ребилда мешей. Клавиша P в игре, чекбокс в меню паузы/настроек.
+        bool pixelateTiles = false;
+
+        /// @brief «Разрешение» тайла при пикселизации (ячеек на сторону тайла).
+        /// 8–16 — жёсткое ретро, 32 — классический низкополигональный вид, 64 — лёгкое
+        /// огрубление. Диапазон зажимается в [4, 128] (атлас рисует тайлы 128×128).
+        float tilePixelRes = 32.0f;
+
         /// @brief Биомы: размер областей, ширина смешивания, частоты типов, сид мира.
         /// Привяжите biomes.seed к сиду мира. enabled=false → весь мир одного типа biomes.forced.
         biome::BiomeConfig biomes{};
@@ -448,6 +474,20 @@ public:
     bool isPixelArtAA() const { return _cfg.pixelArtAA; }
 
     /**
+     * @brief Включён ли биом-зависимый (воронои/желе) террейн.
+     * @note Используется рейкастером: при true прицел строится по реальной
+     *       ячейке Вороного (voronoi::buildBlockFace), при false — по сетке.
+     */
+    bool isVoronoiTerrain() const { return _cfg.voronoiTerrain; }
+
+    /**
+     * @brief Конфиг биомов (сид мира, curvature/softness — чистые функции позиции).
+     * @note Нужен рейкастеру для точного воспроизведения геометрии видимой грани.
+     *       Потокобезопасно: конфиг неизменен после init().
+     */
+    const biome::BiomeConfig& getBiomeConfig() const { return _cfg.biomes; }
+
+    /**
      * @brief Включает/выключает кастомный шейдер террейна (pixel-art AA) на лету.
      *
      * Меняет фильтрацию атласа (LINEAR_MIPMAP_LINEAR ⇄ режим из textureFilter) сразу
@@ -458,6 +498,31 @@ public:
      * @note Только главный поток (трогает _chunks и GL-состояние текстуры).
      */
     void setPixelArtAA(bool enabled);
+
+    /**
+     * @brief Текущее состояние пикселизации тайлов (uniform u_tilePx в шейдерах).
+     */
+    bool isTilePixelate() const { return _cfg.pixelateTiles; }
+
+    /**
+     * @brief «Разрешение» тайла при пикселизации (ячеек на сторону тайла).
+     */
+    float getTilePixelRes() const { return _cfg.tilePixelRes; }
+
+    /**
+     * @brief Включает/выключает пикселизацию тайлов на лету.
+     *
+     * В отличие от setPixelArtAA, здесь НЕ нужен ребилд мешей и смена фильтрации:
+     * пикселизация — квантование UV во фрагментном шейдере, управляется uniform'ом,
+     * который сцены тикают каждый кадр (GameScene::update / MainMenuScene::update).
+     * Поэтому переключение мгновенное и бесплатное.
+     */
+    void setTilePixelate(bool enabled) { _cfg.pixelateTiles = enabled; }
+
+    /**
+     * @brief Задаёт «разрешение» тайла при пикселизации, зажимая в [4, 128].
+     */
+    void setTilePixelRes(float px) { _cfg.tilePixelRes = std::clamp(px, 4.0f, 128.0f); }
 
     /// @} // конец группы "Конструкторы и управление жизненным циклом"
 

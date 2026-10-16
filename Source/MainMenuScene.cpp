@@ -3,6 +3,7 @@
 #include "SaveGameService.h"
 #include "UiTheme.h"
 #include "PerlinNoise.hpp"
+#include "WorldGenerator.h"
 
 #include <cmath>
 #include <algorithm>
@@ -20,6 +21,8 @@ constexpr std::string_view kMenuLoopId = "#menu";
 constexpr const char* kKeyRenderDistance = "settings.renderDistance";
 constexpr const char* kKeyMouseSens      = "settings.mouseSensitivity";
 constexpr const char* kKeyPixelArtAA     = "settings.pixelArtAA";
+constexpr const char* kKeyTilePixelate   = "settings.tilePixelate";
+constexpr const char* kKeyTilePixelRes   = "settings.tilePixelRes";
 /// @}
 }  // namespace
 
@@ -127,69 +130,19 @@ void MainMenuScene::setupChunkManager()
     // textureFilter выше остаётся фолбэком, если выключить pixelArtAA.
     // Значение берём из настроек (общее с игрой), по умолчанию включено.
     cfg.pixelArtAA             = UserDefault::getInstance()->getBoolForKey(kKeyPixelArtAA, true);
+    // Пикселизация тайлов — общая с игрой настройка (uniform на лету), чтобы
+    // превью в меню совпадало с тем, что увидит игрок в мире.
+    cfg.pixelateTiles          = UserDefault::getInstance()->getBoolForKey(kKeyTilePixelate, false);
+    cfg.tilePixelRes           = std::clamp(UserDefault::getInstance()->getFloatForKey(kKeyTilePixelRes, 32.0f), 4.0f, 128.0f);
 
-    cfg.biomes.frequency = {0.40f, 0.20f, 0.40f, 0.0f, 0.0f};
+    cfg.biomes.frequency     = {0.40f, 0.20f, 0.40f, 0.0f, 0.0f};
     cfg.biomes.macroCellSize = 64;
-    cfg.biomes.blendWidth = 16;
-
+    cfg.biomes.blendWidth    = 16;
     _chunkMgr.init(cfg);
 
-    // Генерация в фоновом потоке: полный перлиновый террейн (как в GameScene).
-    _chunkMgr.setOnGenerate([](ChunkData& chunk) {
-        constexpr int SEA_LEVEL = 38;
-
-        const ChunkKey& key = chunk.getKey();
-        auto basePos        = ChunkManager::chunkToWorld(key);
-
-        thread_local siv::PerlinNoise perlin(42);
-        thread_local siv::PerlinNoise rockNoise(137);
-        thread_local siv::PerlinNoise dirtNoise(271);
-
-        for (int x = 0; x < CHUNK_SIZE_X; ++x)
-            for (int z = 0; z < CHUNK_SIZE_Z; ++z)
-            {
-                float wx      = basePos.x + x;
-                float wz      = basePos.z + z;
-                float terrain = perlin.octave2D_01(wx * 0.02, wz * 0.02, 6) * 40.0f;
-                float biome   = perlin.octave2D_01(wx * 0.005, wz * 0.005, 4) * 15.0f - 5.0f;
-                int surfaceY  = std::clamp(static_cast<int>(terrain + biome + 30), 1, CHUNK_SIZE_Y - 2);
-
-                float rockVal = rockNoise.octave2D_01(wx * 0.08, wz * 0.08, 3);
-                float dirtVal = dirtNoise.octave2D_01(wx * 0.06, wz * 0.06, 2);
-
-                for (int y = 0; y <= surfaceY; ++y)
-                {
-                    BlockId block;
-                    if (y == surfaceY)
-                    {
-                        if (rockVal > 0.72f)
-                            block = BLOCK_STONE;
-                        else if (surfaceY < SEA_LEVEL)
-                            block = BLOCK_DIRT;
-                        else if (dirtVal > 0.65f)
-                            block = BLOCK_DIRT;
-                        else
-                            block = BLOCK_GRASS;
-                    }
-                    else if (y > surfaceY - 4)
-                    {
-                        block = BLOCK_DIRT;
-                    }
-                    else
-                    {
-                        block = BLOCK_STONE;
-                    }
-
-                    chunk.setBlock(x, y, z, block);
-                }
-
-                if (surfaceY < SEA_LEVEL)
-                {
-                    for (int y = surfaceY + 1; y <= SEA_LEVEL; ++y)
-                        chunk.setBlock(x, y, z, BLOCK_WATER);
-                }
-            }
-    });
+    // Генерация в фоновом потоке: общий генератор мира (как в GameScene),
+    // включая пляжи, гравий и рудные жилы — см. WorldGenerator.h.
+    _chunkMgr.setOnGenerate([](ChunkData& chunk) { worldgen::generate(chunk); });
 
     // Визуализация в главном потоке: маска USER1, добавление в граф сцены.
     // Водный нод помечен WATER_NODE_TAG в buildWaterVisualNode — различаем по тегу.
@@ -248,6 +201,10 @@ void MainMenuScene::update(float dt)
 
     const ax::Vec3 camWorld = _orbitCamera ? _orbitCamera->getPosition3D() : ax::Vec3::ZERO;
 
+    // Пикселизация тайлов: uniform-only (0 = выкл), переключается на лету —
+    // общий переключатель для террейна и воды (и общий с игрой ключ настройки).
+    const float tilePx = _chunkMgr.isTilePixelate() ? _chunkMgr.getTilePixelRes() : 0.0f;
+
     for (auto* node : _waterNodes)
     {
         if (!node)
@@ -275,10 +232,16 @@ void MainMenuScene::update(float dt)
             auto locFogEnd = ps->getUniformLocation("u_fogEnd");
             ps->setUniform(locFogSt, &fogStart, sizeof(float));
             ps->setUniform(locFogEnd, &fogEnd, sizeof(float));
+
+            // Пикселизация тайлов — общий с террейном переключатель (uniform на лету).
+            auto locPx = ps->getUniformLocation("u_tilePx");
+            if (locPx)
+                ps->setUniform(locPx, &tilePx, sizeof(float));
         }
     }
 
     // === Дрожание желе: те же часы анимации уходят в шейдер террейна ===
+    // u_camWorld нужен фрагментнику для френеля желе-шиммера.
     for (auto* node : _terrainNodes)
     {
         if (!node)
@@ -290,6 +253,12 @@ void MainMenuScene::update(float dt)
             auto locTime = ps->getUniformLocation("u_time");
             if (locTime)
                 ps->setUniform(locTime, &_animTime, sizeof(float));
+            auto locCam = ps->getUniformLocation("u_camWorld");
+            if (locCam)
+                ps->setUniform(locCam, &camWorld, sizeof(ax::Vec3));
+            auto locPx = ps->getUniformLocation("u_tilePx");
+            if (locPx)
+                ps->setUniform(locPx, &tilePx, sizeof(float));
         }
     }
 
@@ -387,6 +356,23 @@ void MainMenuScene::onDrawSettings()
     {
         ud->setBoolForKey(kKeyPixelArtAA, pixelAA);
         _chunkMgr.setPixelArtAA(pixelAA);  // живое применение к фону меню
+    }
+
+    // Пикселизация тайлов (ретро-режим) — uniform-only, применяется к превью сразу.
+    bool tilePxOn = ud->getBoolForKey(kKeyTilePixelate, false);
+    if (ImGui::Checkbox("Пикселизация тайлов (ретро)", &tilePxOn))
+    {
+        ud->setBoolForKey(kKeyTilePixelate, tilePxOn);
+        _chunkMgr.setTilePixelate(tilePxOn);  // живое применение к фону меню
+    }
+    if (tilePxOn)
+    {
+        int res = static_cast<int>(ud->getFloatForKey(kKeyTilePixelRes, 32.0f));
+        if (ImGui::SliderInt("Разрешение тайлов", &res, 8, 64))
+        {
+            ud->setFloatForKey(kKeyTilePixelRes, static_cast<float>(res));
+            _chunkMgr.setTilePixelRes(static_cast<float>(res));
+        }
     }
 
     ImGui::Dummy(ImVec2(0.0f, 18.0f));

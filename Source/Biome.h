@@ -69,7 +69,9 @@ struct BiomeConfig
     float blendWidth    = 32.0f;   ///< Ширина полосы смешивания (по разности расстояний до сидов), блоков
 
     /// Относительные частоты выбора типа макро-ячейкой. Reserved выключены (0).
-    std::array<float, kBiomeCount> frequency{{0.40f, 0.40f, 0.20f, 0.0f, 0.0f}};
+    /// Веса относительные: нормализуются в pickType(), сумму держать равной 1 не нужно.
+    /// Порядок — как в BiomeType: {Classic, Voronoi, Jelly, Reserved3, Reserved4}.
+    std::array<float, kBiomeCount> frequency{{0.30f, 0.35f, 0.35f, 0.0f, 0.0f}};
 };
 
 struct BiomeSample

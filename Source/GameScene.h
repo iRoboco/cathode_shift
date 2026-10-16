@@ -45,6 +45,13 @@ public:
     /// @brief Переключает pixel-art AA шейдер вживую и сохраняет настройку (вызывается из паузы).
     void setPixelArtAA(bool enabled);
 
+    /// @brief Вкл/выкл пикселизацию тайлов («занижение» разрешения атласа) вживую + сохранение
+    /// (клавиша P, чекбокс в меню паузы). Uniform-only — меши не перестраиваются.
+    void setTilePixelate(bool enabled);
+
+    /// @brief Задаёт «разрешение» тайла при пикселизации (ячеек на сторону) вживую + сохранение.
+    void setTilePixelRes(float px);
+
 protected:
     // Axmol вызывает эти методы при сворачивании/разворачивании окна
     void onEnter() override;

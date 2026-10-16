@@ -90,6 +90,8 @@ ax_target_compile_shaders(${APP_NAME}
         ${CMAKE_CURRENT_SOURCE_DIR}/Source/shaders/terrain.frag
         ${CMAKE_CURRENT_SOURCE_DIR}/Source/shaders/voronoi_terrain.vert
         ${CMAKE_CURRENT_SOURCE_DIR}/Source/shaders/voronoi_terrain.frag
+        ${CMAKE_CURRENT_SOURCE_DIR}/Source/shaders/highlight.vert
+        ${CMAKE_CURRENT_SOURCE_DIR}/Source/shaders/highlight.frag
 )
 
 # Add any libraries you need to link to the project after this point

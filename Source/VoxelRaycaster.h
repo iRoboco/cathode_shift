@@ -15,6 +15,12 @@
 #pragma once
 #include "axmol.h"
 #include "ChunkManager.h"
+
+namespace ax::backend
+{
+class ProgramState;
+}
+
 #include <optional>
 #include <functional>
 #include <cstdint>
@@ -304,6 +310,8 @@ public:
 
 private:
     // === Рендер компоненты ===
+    /// Тикает u_time/u_tintColor в шейдере прицела (те же часы, что у террейна)
+    void tickShaderUniforms();
     void updateFaceHighlight(const VoxelHit& hit);
     void updatePlacePreview(const VoxelHit& hit);
     void updateBreakProgress(const VoxelHit& hit);
@@ -314,6 +322,8 @@ private:
     void hideAll();
 
     // === Меш-билдинг ===
+    /// Воронои-путь: точный полигон видимой грани (nullptr → откат на сеточный квад)
+    ax::Mesh* createVoronoiFaceMesh(const VoxelHit& hit, float pushOut, float insetScale);
     ax::Mesh* createFaceHighlightMesh(const VoxelHit& hit);
     ax::Mesh* createPlacePreviewMesh(const VoxelHit& hit);
     ax::Mesh* createBreakProgressMesh(const VoxelHit& hit, float progress);
@@ -364,6 +374,21 @@ private:
     // Кэш последнего хита для предотвращения пересоздания мешей каждый кадр
     VoxelHit _lastFaceHighlightHit{};
     bool _faceHighlightDirty = true;
+
+    // ============================================================================
+    //  Прицел по реальной грани (воронои/желе террейн)
+    //
+    //  Когда включён voronoiTerrain, геометрия подсветки и прогресса разрушения
+    //  строится voronoi::buildBlockFace() — точная ячейка Вороного + желейное
+    //  смещение. Анимация (дрожание желе, покачивание травы) повторяется шейдером
+    //  custom/highlight_* синхронно с террейном: _animTime тикает тем же dt,
+    //  что часы GameScene. Если программа не собрана — откат на сеточный квад.
+    // ============================================================================
+    ax::backend::ProgramState* _highlightPS = nullptr;  ///< retain'ится, общий для highlight
+    ax::backend::ProgramState* _breakPS     = nullptr;  ///< retain'ится, для прогресса
+    float _animTime = 0.0f;                             ///< часы анимации шейдера прицела
+    bool _faceMeshIsVoronoi  = false;                   ///< последний highlight-меш — воронои?
+    bool _breakMeshIsVoronoi = false;                   ///< последний progress-меш — воронои?
 
     // Флаг видимости превью
     bool _placePreviewVisible = true;

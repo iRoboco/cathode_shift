@@ -28,6 +28,8 @@ layout(std140) uniform fs_ub {
     vec3  u_fogColor;  // цвет тумана
     float u_fogStart;  // дистанция начала тумана (мировые единицы)
     float u_fogEnd;    // дистанция полного тумана (мировые единицы)
+    float u_tilePx;    // пикселизация тайла воды: 0 = выкл, >0 = «пикселей» на
+                       // сторону тайла (тот же переключатель, что у террейна)
     // u_time НЕ объявляем здесь: он живёт только в vs_ub и приходит как varying v_time
     // (см. water.vert) — иначе дублирование имени ломает вершинную анимацию волн.
 };
@@ -62,7 +64,20 @@ void main(void)
     float fresnel = 0.02 + 0.98 * pow(1.0 - NdotV, 5.0);
 
     // --- Базовый цвет: глубина имитируется по Fresnel + текстура атласа ---
-    vec3  tex      = texture(u_tex0, v_texCoord).rgb;
+    // Пикселизация тайла — та же схема, что в voronoi_terrain.frag: квантуем UV
+    // внутри тайла, градиенты — от непрерывных координат (без мип-мерцания).
+    vec2 uv = v_texCoord;
+    vec3 tex;
+    if (u_tilePx > 0.0)
+    {
+        vec2 g  = uv * 4.0;                            // 4 = тайлов в ряду атласа (texgen::kTiles)
+        vec2 tl = floor(g);
+        vec2 f  = fract(g);
+        f  = (floor(f * u_tilePx) + 0.5) / u_tilePx;
+        tex = textureGrad(u_tex0, (tl + f) * 0.25, dFdx(uv), dFdy(uv)).rgb;
+    }
+    else
+        tex = texture(u_tex0, uv).rgb;
     vec3  baseCol  = mix(DEEP_COLOR, SHALLOW_COLOR, NdotV);
     baseCol        = mix(baseCol, baseCol * (0.7 + 0.6 * tex.b), 0.35);
 
