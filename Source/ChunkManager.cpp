@@ -644,7 +644,7 @@ ax::Node* ChunkManager::buildWaterVisualNode(const ChunkKey& key, ChunkData& dat
     // === Генерация геометрии воды ===
     std::vector<ChunkVertex> verts;
     ax::IndexArray inds;
-    buildWaterMesh(data, neighborX0, neighborX1, neighborZ0, neighborZ1, verts, inds);
+    buildWaterMesh(data, neighborX0, neighborX1, neighborZ0, neighborZ1, verts, inds, _cfg.seaLevel);
     if (verts.empty())
         return nullptr;  // Вода отсутствует → оптимизация
 

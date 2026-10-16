@@ -98,6 +98,8 @@ void FirstPersonController::resetVelocity()
 {
     _currentVelocity = ax::Vec3::ZERO;
     _targetVelocity  = ax::Vec3::ZERO;
+    _stepUpVelocity  = 0.0f;
+    _isSteppingUp    = false;
 }
 
 // =========================================================================
@@ -348,6 +350,16 @@ void FirstPersonController::update(float dt)
 
     _currentVelocity.y += _gravity * dt;
 
+    // Подъём на ступеньку: пока он активен, гравитация не должна «съедать»
+    // вертикальную скорость между кадрами. Иначе при низком FPS (dt ≥ 1/25)
+    // приращение гравитации за кадр (|g|·dt ≥ 1.0) превышает минимальную
+    // скорость подъёма, резолвер отклоняет step-up (условие velocity.y > 0),
+    // и игрок залипает у края блока — слегка приподнимается, но не перелезает.
+    if (_isSteppingUp)
+    {
+        _currentVelocity.y = _stepUpVelocity;
+    }
+
     if (_isGrounded && _keySpace)
     {
         _currentVelocity.y = _jumpForce;
@@ -376,9 +388,17 @@ void FirstPersonController::update(float dt)
         // высотой ≤1 блока, резолвер каждый кадр запрашивает step-up. Скорость
         // пропорциональна оставшейся высоте: быстрый старт, мягкая посадка наверху —
         // без инерционного «докидывания» над ступенькой.
+        // Скорость запоминается в _stepUpVelocity: подъём идёт несколько кадров,
+        // и гравитация не должна обнулять её раньше времени (см. выше).
         if (result.stepUp)
         {
-            _currentVelocity.y = std::clamp(result.stepUpHeight * 20.0f, 1.0f, _stepUpSpeed);
+            _stepUpVelocity    = std::clamp(result.stepUpHeight * 20.0f, 1.0f, _stepUpSpeed);
+            _currentVelocity.y = _stepUpVelocity;
+            _isSteppingUp      = true;
+        }
+        else
+        {
+            _isSteppingUp = false;
         }
 
         // Защитный clamp — предотвращает провал ниже Y=0.

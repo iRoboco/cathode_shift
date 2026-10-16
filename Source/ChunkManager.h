@@ -107,6 +107,7 @@ static constexpr BlockId BLOCK_COAL_ORE    = 7;   ///< Угольная руда
 static constexpr BlockId BLOCK_IRON_ORE    = 8;   ///< Железная руда (y <= 40)
 static constexpr BlockId BLOCK_GOLD_ORE    = 9;   ///< Золотая руда (y <= 24)
 static constexpr BlockId BLOCK_CRYSTAL_ORE = 10;  ///< Кристаллическая руда (y <= 16)
+static constexpr BlockId BLOCK_SNOW        = 11;  ///< Снег (ЗАГОТОВКА: снежные регионы севера/юга, WorldConfig)
 
 /// @brief Уникальный тег для идентификации водных нодов в коллбеках визуализации
 static constexpr int WATER_NODE_TAG = 0x574154;  // ASCII 'WAT'
@@ -330,6 +331,10 @@ public:
         /// Привяжите biomes.seed к сиду мира. enabled=false → весь мир одного типа biomes.forced.
         biome::BiomeConfig biomes{};
 
+        /// @brief Уровень моря активного мира (worldcfg::WorldDef::seaLevel).
+        /// Используется buildWaterMesh; генератор террейна обязан заливать воду до него же.
+        int seaLevel = 38;
+
         /// @brief Сборка мешей террейна в фоновых воркерах (общая очередь с генерацией).
         /// false → прежнее поведение: меш строится синхронно в главном потоке.
         bool asyncMeshing = true;
@@ -486,6 +491,15 @@ public:
      *       Потокобезопасно: конфиг неизменен после init().
      */
     const biome::BiomeConfig& getBiomeConfig() const { return _cfg.biomes; }
+
+    /**
+     * @brief Атлас текстур террейна (процедурный или из PNG), созданный в init().
+     * @note Рейкастер и прочие системы обязаны брать атлас ОТСЮДА, а не грузить
+     *       textures/terrain_atlas.png самостоятельно: при proceduralTextures=true
+     *       PNG не существует, и самостоятельная загрузка молча даёт белый fallback.
+     *       Указатель валиден, пока менеджер жив (shutdown сбрасывает текстуру).
+     */
+    ax::Texture2D* getTerrainAtlas() const { return _terrainAtlas; }
 
     /**
      * @brief Включает/выключает кастомный шейдер террейна (pixel-art AA) на лету.

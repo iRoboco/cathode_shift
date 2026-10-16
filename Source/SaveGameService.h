@@ -27,6 +27,11 @@ public:
     /// @brief Существует ли валидный файл сохранения (для активации пункта «Продолжить»).
     static bool hasSave();
 
+    /// @brief Прочитать только id мира из сейва (без создания сцены).
+    /// Нужен GameScene::createFromSave, чтобы сразу поднять правильный мир.
+    /// @return id мира или пустая строка (нет сейва / поля / повреждённый JSON).
+    static std::string readSavedWorldId();
+
 private:
     /// @brief Абсолютный путь к файлу сохранения в writable-каталоге.
     static std::string savePath();

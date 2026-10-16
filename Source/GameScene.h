@@ -3,6 +3,9 @@
 #include "ChunkManager.h"
 #include "FirstPersonController.h"
 #include "VoxelRaycaster.h"
+#include "WorldConfig.h"
+#include <memory>
+#include <string>
 
 class PauseOverlay;
 
@@ -25,6 +28,10 @@ public:
 
     bool init() override;
 
+    /// @brief Инициализация с явным выбором мира (id из Content/config/worlds.json).
+    /// Пустая строка — выбор по умолчанию (UserDefault → activeWorld из JSON).
+    bool initWithWorldId(const std::string& worldId);
+
     // Деструктор для корректного shutdown() ChunkManager
     // Вызывается только при полном уничтожении сцены (replaceScene, quit),
     // но НЕ при сворачивании приложения.
@@ -36,6 +43,18 @@ public:
 
     /// @brief Телепортирует игрока в указанную позицию (используется загрузкой сохранения).
     void setPlayerPosition(const ax::Vec3& pos);
+
+    // === Система миров (Content/config/worlds.json) ===
+    /// @brief Переключает активный мир: запоминает выбор и пересоздаёт сцену
+    /// (полный teardown чанк-менеджера через деструктор, затем подъём нового мира
+    /// с его сидом, профилем террейна и регионами). @return false если id неизвестен.
+    bool switchWorld(const std::string& worldId);
+    /// @brief id активного мира (пишется в файл сохранения).
+    const std::string& getWorldId() const { return _worldId; }
+    /// @brief Каталог всех миров из конфига (для UI выбора мира).
+    const worldcfg::WorldCatalog& getWorldCatalog() const { return _worldCatalog; }
+    /// @brief Активный мир (принадлежит каталогу / фолбэку сцены).
+    const worldcfg::WorldDef* getActiveWorld() const { return _world; }
 
     // === Пауза (оверлей поверх живой сцены) ===
     void pauseGame();                       ///< Показать меню паузы, заморозить ввод игрока
@@ -61,6 +80,16 @@ private:
     void update(float dt) override;
     // Обработчик клавиатуры для перезапуска уровня
     void onKeyPressed(ax::EventKeyboard::KeyCode keyCode, ax::Event* event);
+
+    // === Система миров ===
+    // ВАЖНО: порядок объявления имеет значение. _chunkMgr объявлен ПОСЛЕ каталога,
+    // значит разрушается ПЕРВЫМ — его shutdown() в деструкторе гарантированно
+    // останавливает воркеры до уничтожения _worldCatalog, на WorldDef которого
+    // ссылается лямбда генерации чанков.
+    worldcfg::WorldCatalog _worldCatalog;              ///< Каталог миров из Content/config/worlds.json
+    std::unique_ptr<worldcfg::WorldDef> _fallbackWorld;  ///< Аварийный мир, если конфиг не загрузился
+    const worldcfg::WorldDef* _world = nullptr;        ///< Активный мир (не владеем)
+    std::string _worldId;                              ///< id активного мира (для сейва)
 
     // Ядро генерации мира
     ChunkManager _chunkMgr;

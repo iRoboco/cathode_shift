@@ -38,13 +38,19 @@ bool VoxelRaycasterNode::init(ax::Camera* camera, ChunkManager* mgr, float maxDi
     _mgr     = mgr;
     _maxDist = maxDist;
 
-    // Получаем текстуру атласа из ChunkManager или создаём fallback
-    // Примечание: ChunkManager не экспонирует _terrainAtlas, поэтому
-    // загружаем самостоятельно или используем белую текстуру
-    _terrainAtlas = ax::Director::getInstance()->getTextureCache()->addImage("textures/terrain_atlas.png");
+    // Атлас террейна — строго из ChunkManager. При proceduralTextures=true PNG
+    // textures/terrain_atlas.png НЕ существует: самостоятельная загрузка молча
+    // давала 1x1 белый fallback, и частицы копания/разрушения рендерились белым.
+    _terrainAtlas = _mgr->getTerrainAtlas();
     if (!_terrainAtlas)
     {
-        // Fallback: создаём 1x1 белую текстуру для tint-only рендера
+        // Запасной путь: менеджер ещё не инициализирован — пробуем PNG...
+        _terrainAtlas = ax::Director::getInstance()->getTextureCache()->addImage("textures/terrain_atlas.png");
+    }
+    if (!_terrainAtlas)
+    {
+        // ...и только затем 1x1 белый fallback для tint-only рендера
+        AXLOGW("[VoxelRaycaster] terrain atlas unavailable, using 1x1 white fallback");
         auto* image           = new ax::Image();
         unsigned char white[] = {255, 255, 255, 255};
         image->initWithRawData(white, sizeof(white), 1, 1, 8);

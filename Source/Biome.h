@@ -72,6 +72,22 @@ struct BiomeConfig
     /// Веса относительные: нормализуются в pickType(), сумму держать равной 1 не нужно.
     /// Порядок — как в BiomeType: {Classic, Voronoi, Jelly, Reserved3, Reserved4}.
     std::array<float, kBiomeCount> frequency{{0.30f, 0.35f, 0.35f, 0.0f, 0.0f}};
+
+    /// Региональная модуляция геометрии (макро-регионы мира, см. WorldConfig.h).
+    /// Указатель НЕ владеющий: живёт, пока жив WorldDef. nullptr — без модуляции.
+    /// Вызывается в конце sample(): регион может плавно глушить/усиливать
+    /// curvature/softness (например, снежный север → curvature × 0 → кубы).
+    const class IRegionModulator* regionModulator = nullptr;
+};
+
+/// Интерфейс региональной модуляции геометрии. Реализуется WorldDef (WorldConfig.h).
+/// ДОЛЖЕН быть чистой потокобезопасной функцией позиции (вызывается из воркеров мешинга).
+class IRegionModulator
+{
+public:
+    virtual ~IRegionModulator() = default;
+    /// Модулирует curvature/softness в точке (wx, wz) силами регионов мира.
+    virtual void modulate(double wx, double wz, float& curvature, float& softness) const = 0;
 };
 
 struct BiomeSample
@@ -145,6 +161,8 @@ inline BiomeSample sample(const BiomeConfig& c, double wx, double wz)
         s.curvature                           = kTraits[static_cast<int>(c.forced)].curvature;
         s.softness                            = kTraits[static_cast<int>(c.forced)].softness;
         s.dominant                            = c.forced;
+        if (c.regionModulator)
+            c.regionModulator->modulate(wx, wz, s.curvature, s.softness);
         return s;
     }
 
@@ -183,6 +201,8 @@ inline BiomeSample sample(const BiomeConfig& c, double wx, double wz)
             best = i;
     }
     s.dominant = static_cast<BiomeType>(best);
+    if (c.regionModulator)
+        c.regionModulator->modulate(wx, wz, s.curvature, s.softness);
     return s;
 }
 

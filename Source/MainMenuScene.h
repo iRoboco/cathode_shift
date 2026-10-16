@@ -16,6 +16,7 @@
 
 #include "axmol.h"
 #include "ChunkManager.h"
+#include "WorldConfig.h"
 
 class MainMenuScene : public ax::Scene
 {
@@ -40,6 +41,11 @@ private:
     void onDrawSettings();  ///< Панель настроек (дальность прорисовки, чувствительность мыши)
 
     // === 3D-превью ===
+    // Каталог миров объявлен ДО чанк-менеджера: разрушается позже него, а
+    // shutdown() в деструкторе гарантированно останавливает воркеры до
+    // уничтожения WorldDef, на который ссылается лямбда генерации.
+    worldcfg::WorldCatalog _worldCatalog;           ///< Миры из Content/config/worlds.json
+    const worldcfg::WorldDef* _world = nullptr;     ///< Активный мир превью (не владеем)
     ChunkManager _chunkMgr;
     ax::Camera* _orbitCamera = nullptr;
     ax::Vec3 _worldCenter{8.0f, 34.0f, 8.0f};  ///< Точка, вокруг которой облётывает камера

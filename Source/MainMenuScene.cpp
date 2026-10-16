@@ -135,14 +135,33 @@ void MainMenuScene::setupChunkManager()
     cfg.pixelateTiles          = UserDefault::getInstance()->getBoolForKey(kKeyTilePixelate, false);
     cfg.tilePixelRes           = std::clamp(UserDefault::getInstance()->getFloatForKey(kKeyTilePixelRes, 32.0f), 4.0f, 128.0f);
 
-    cfg.biomes.frequency     = {0.40f, 0.20f, 0.40f, 0.0f, 0.0f};
-    cfg.biomes.macroCellSize = 64;
-    cfg.biomes.blendWidth    = 16;
+    // === Каталог миров (тот же Content/config/worlds.json, что и в игре) ===
+    // Превью показывает активный мир: последний выбор игрока (UserDefault) →
+    // activeWorld из JSON. Биомы геометрии и уровень моря — из конфига мира.
+    {
+        const std::string worldsJson = FileUtils::getInstance()->getStringFromFile("config/worlds.json");
+        if (worldsJson.empty() || !_worldCatalog.loadFromString(worldsJson))
+            AXLOGW("MainMenuScene: config/worlds.json не загружен — мир по умолчанию");
+        const std::string lastWorld{UserDefault::getInstance()->getStringForKey("worlds.activeWorldId", "")};  // string_view → string (explicit)
+        if (!lastWorld.empty())
+            _worldCatalog.setActive(lastWorld);
+        _world = _worldCatalog.active();
+        if (!_world)
+        {
+            // Фолбэк без каталога: WorldDef по умолчанию = прежнее поведение.
+            static worldcfg::WorldDef s_fallback;
+            _world = &s_fallback;
+        }
+    }
+
+    cfg.biomes   = _world->biomes;
+    cfg.seaLevel = _world->seaLevel;
     _chunkMgr.init(cfg);
 
-    // Генерация в фоновом потоке: общий генератор мира (как в GameScene),
-    // включая пляжи, гравий и рудные жилы — см. WorldGenerator.h.
-    _chunkMgr.setOnGenerate([](ChunkData& chunk) { worldgen::generate(chunk); });
+    // Генерация в фоновом потоке: общий генератор мира по профилю активного
+    // мира (рельеф, бугры, озёра, пляжи, гравий, руды, регионы) — WorldGenerator.h.
+    const worldcfg::WorldDef* world = _world;
+    _chunkMgr.setOnGenerate([world](ChunkData& chunk) { worldgen::generate(chunk, *world); });
 
     // Визуализация в главном потоке: маска USER1, добавление в граф сцены.
     // Водный нод помечен WATER_NODE_TAG в buildWaterVisualNode — различаем по тегу.

@@ -1,0 +1,158 @@
+{
+  "version": 1,
+  "activeWorld": "overworld",
+
+  "worlds": [
+    {
+      "id": "overworld",
+      "name": "Верхний мир",
+      "seed": 1337,
+      "spawn": { "x": 0, "z": 0 },
+
+      "geometry": {
+        "enabled": true,
+        "macroCellSize": 64,
+        "blendWidth": 16,
+        "frequency": { "classic": 0.4, "voronoi": 0.2, "jelly": 0.4 }
+      },
+
+      "water": { "enabled": true, "seaLevel": 38 },
+
+      "terrain": {
+        "baseHeight": 30,
+        "amplitude": 40,
+        "terrainFreq": 0.02,
+        "octaves": 6,
+        "macroOffset": 15,
+        "macroShift": -5,
+        "macroFreq": 0.005,
+        "macroOctaves": 4
+      },
+
+      "materials": {
+        "surfacePrimary": "grass",
+        "surfaceBeach": "sand",
+        "surfaceUnderwater": "dirt",
+        "surfaceRock": "stone",
+        "surfaceGravel": "gravel",
+        "surfaceCrust": "dirt",
+        "subSurface": "dirt",
+        "subDepth": 3
+      },
+
+      "weather": { "type": "clear", "temperature": 15, "humidity": 0.5 },
+
+      "regions": [
+        {
+          "name": "Центральные горы",
+          "ring": { "rMin": 0, "rMax": 1000 },
+          "blend": 150,
+          "terrain": {
+            "baseHeight": 55,
+            "amplitude": 70,
+            "terrainFreq": 0.016,
+            "octaves": 6,
+            "macroOffset": 25
+          },
+          "materials": {
+            "rockThreshold": 0.55,
+            "rockFreq": 0.05
+          },
+          "geometry": { "curvatureScale": 1.2, "softnessScale": 0.7 },
+          "weather": { "type": "clear", "temperature": 8, "humidity": 0.4 }
+        },
+        {
+          "name": "Равнина с буграми и озёрами",
+          "ring": { "rMin": 1000, "rMax": 2000 },
+          "blend": 150,
+          "terrain": {
+            "baseHeight": 36,
+            "amplitude": 8,
+            "terrainFreq": 0.03,
+            "octaves": 4,
+            "macroOffset": 6,
+            "macroShift": -2,
+            "hills": { "amplitude": 4.0, "freq": 0.09, "threshold": 0.55 },
+            "lakes": { "enabled": true, "freq": 0.004, "threshold": 0.58, "depth": 16 }
+          },
+          "geometry": { "curvatureScale": 0.5, "softnessScale": 1.0 },
+          "weather": { "type": "clear", "temperature": 18, "humidity": 0.65 }
+        },
+        {
+          "name": "Северные снега",
+          "latitude": { "zMax": -1500 },
+          "blend": 250,
+          "terrain": {
+            "baseHeight": 44,
+            "amplitude": 26,
+            "hills": { "amplitude": 3.0, "freq": 0.07, "threshold": 0.6 }
+          },
+          "materials": {
+            "surfacePrimary": "snow",
+            "surfaceCrust": "dirt",
+            "subSurface": "dirt",
+            "dirtThreshold": 0.75
+          },
+          "geometry": { "curvatureScale": 0.0, "softnessScale": 0.0 },
+          "weather": { "type": "snow", "temperature": -15, "humidity": 0.7 }
+        },
+        {
+          "name": "Южные снега",
+          "latitude": { "zMin": 2500 },
+          "blend": 250,
+          "terrain": {
+            "baseHeight": 44,
+            "amplitude": 26,
+            "hills": { "amplitude": 3.0, "freq": 0.07, "threshold": 0.6 }
+          },
+          "materials": {
+            "surfacePrimary": "snow",
+            "dirtThreshold": 0.75
+          },
+          "geometry": { "curvatureScale": 0.0, "softnessScale": 0.0 },
+          "weather": { "type": "snow", "temperature": -12, "humidity": 0.65 }
+        }
+      ]
+    },
+
+    {
+      "id": "jelly_depths",
+      "name": "Желейные глубины",
+      "seed": 9021,
+      "spawn": { "x": 0, "z": 0 },
+
+      "geometry": {
+        "enabled": false,
+        "forced": "jelly"
+      },
+
+      "water": { "enabled": true, "seaLevel": 34 },
+
+      "terrain": {
+        "baseHeight": 26,
+        "amplitude": 22,
+        "terrainFreq": 0.025,
+        "octaves": 5,
+        "macroOffset": 8,
+        "macroShift": -2,
+        "lakes": { "enabled": true, "freq": 0.01, "threshold": 0.58, "depth": 12 }
+      },
+
+      "materials": {
+        "surfacePrimary": "grass",
+        "dirtThreshold": 0.55,
+        "gravelThreshold": 0.70,
+        "ores": [
+          { "block": "gravel",      "maxY": 255, "threshold": 0.84, "freq": 0.14 },
+          { "block": "coal_ore",    "maxY": 60,  "threshold": 0.78, "freq": 0.14 },
+          { "block": "iron_ore",    "maxY": 44,  "threshold": 0.80, "freq": 0.15 },
+          { "block": "crystal_ore", "maxY": 28,  "threshold": 0.84, "freq": 0.16 }
+        ]
+      },
+
+      "weather": { "type": "rain", "temperature": 22, "humidity": 0.9 },
+
+      "regions": []
+    }
+  ]
+}

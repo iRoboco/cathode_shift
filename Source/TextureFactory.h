@@ -49,6 +49,7 @@ enum Tile : int
     TILE_IRON_ORE = 8,
     TILE_GOLD_ORE = 9,
     TILE_CRYSTAL_ORE = 10,
+    TILE_SNOW = 11,  ///< Снег (заготовка для снежных регионов, BLOCK_SNOW)
 };
 
 // ---------------------------------------------------------------------------
@@ -156,6 +157,18 @@ inline RGB dirt(float u, float v, uint64_t seed)
         col = lerpRGB({0.44f, 0.40f, 0.36f}, {0.55f, 0.52f, 0.48f}, n);
     col = mulRGB(col, 1.0f + 0.07f * saltPepper(u, v, 128.0f, seed + 52));
     return bevel(col, u, v, 0.03f, 0.86f);
+}
+
+/// Снег (заготовка для снежных регионов): белый с голубоватыми тенями и кристалликами.
+inline RGB snow(float u, float v, uint64_t seed)
+{
+    const float n = warp(u * 4.0f, v * 4.0f, seed + 61, 0.9f);
+    RGB col       = lerpRGB({0.78f, 0.84f, 0.94f}, {0.95f, 0.97f, 1.0f}, std::pow(n, 0.9f));
+    // редкие блестящие кристаллики
+    if (hashL(static_cast<int>(std::floor(u * 64)), static_cast<int>(std::floor(v * 64)), seed + 63) > 0.965f)
+        col = RGB{1.0f, 1.0f, 1.0f};
+    col = mulRGB(col, 1.0f + 0.05f * saltPepper(u, v, 128.0f, seed + 64));
+    return bevel(col, u, v, 0.03f, 0.92f);
 }
 
 inline RGB grassSide(float u, float v, uint64_t seed)
@@ -287,7 +300,8 @@ inline RGB paintTilePx(int tile, float u, float v, uint64_t s)
     case TILE_IRON_ORE:    return ironOre(u, v, s);     // 8
     case TILE_GOLD_ORE:    return goldOre(u, v, s);     // 9
     case TILE_CRYSTAL_ORE: return crystalOre(u, v, s);  // 10
-    default:               return spare(u, v, s);       // 11..15 — запас
+    case TILE_SNOW:        return snow(u, v, s);        // 11
+    default:               return spare(u, v, s);       // 12..15 — запас
     }
 }
 

@@ -19,6 +19,7 @@ constexpr const char* kKeyMouseSens      = "settings.mouseSensitivity";
 constexpr const char* kKeyPixelArtAA     = "settings.pixelArtAA";
 constexpr const char* kKeyTilePixelate   = "settings.tilePixelate";
 constexpr const char* kKeyTilePixelRes   = "settings.tilePixelRes";
+constexpr const char* kKeyActiveWorld    = "worlds.activeWorldId";
 /// @}
 }  // namespace
 
@@ -42,11 +43,14 @@ ax::Scene* GameScene::create()
 // =========================================================================
 GameScene* GameScene::createFromSave()
 {
-    auto* ret = new (std::nothrow) GameScene();
-    if (ret && ret->init())
+    // worldId из сейва читаем ДО создания сцены, чтобы мир сразу поднялся
+    // с правильным сидом/профилем/регионами (иначе пришлось бы пересоздавать сцену).
+    const std::string savedWorld = SaveGameService::readSavedWorldId();
+    auto* ret                    = new (std::nothrow) GameScene();
+    if (ret && ret->initWithWorldId(savedWorld))
     {
         ret->autorelease();
-        // Применяем сохранённые данные поверх инициализированного мира.
+        // Применяем сохранённую позицию поверх инициализированного мира.
         // При отсутствии/повреждении файла остаёмся на спавне по умолчанию.
         SaveGameService::loadGame(ret);
         return ret;
@@ -71,6 +75,11 @@ GameScene::~GameScene()
 //  init
 // =========================================================================
 bool GameScene::init()
+{
+    return initWithWorldId(std::string());
+}
+
+bool GameScene::initWithWorldId(const std::string& worldId)
 {
     if (!Scene::init())
         return false;
@@ -123,15 +132,50 @@ bool GameScene::init()
     // без ребилда мешей и перегенерации атласа. Настройка сохраняется.
     cfg.pixelateTiles            = ud->getBoolForKey(kKeyTilePixelate, false);
     cfg.tilePixelRes             = std::clamp(ud->getFloatForKey(kKeyTilePixelRes, 32.0f), 4.0f, 128.0f);
- 
-    cfg.biomes.frequency     = {0.40f, 0.20f, 0.40f, 0.0f, 0.0f};
-    cfg.biomes.macroCellSize = 64;
-    cfg.biomes.blendWidth    = 16;
+
+    // === Каталог миров — единый конфиг уровней (Content/config/worlds.json) ===
+    // Приоритет выбора: явный worldId (загрузка сейва) → последний выбор игрока
+    // (UserDefault, ставится в switchWorld) → activeWorld из JSON.
+    {
+        const std::string worldsJson = FileUtils::getInstance()->getStringFromFile("config/worlds.json");
+        if (worldsJson.empty() || !_worldCatalog.loadFromString(worldsJson))
+            AXLOGW("GameScene: config/worlds.json не загружен — аварийный мир по умолчанию");
+
+        if (!worldId.empty())
+            _worldCatalog.setActive(worldId);  // неизвестный id молча игнорируется
+        else
+        {
+            const std::string lastWorld{ud->getStringForKey(kKeyActiveWorld, "")};  // string_view → string (explicit)
+            if (!lastWorld.empty())
+                _worldCatalog.setActive(lastWorld);
+        }
+
+        _world = _worldCatalog.active();
+        if (!_world)
+        {
+            // Фолбэк: конфиг отсутствует/повреждён — игра должна работать.
+            // WorldDef по умолчанию воспроизводит прежнее поведение генератора.
+            _fallbackWorld = std::make_unique<worldcfg::WorldDef>();
+            _fallbackWorld->id   = "fallback";
+            _fallbackWorld->name = "Мир по умолчанию";
+            _world               = _fallbackWorld.get();
+        }
+        _worldId = _world->id;
+        AXLOGI("GameScene: активный мир '{}' ({})", _worldId, _world->name);
+    }
+
+    // Биомы геометрии (Classic/Voronoi/Jelly + региональная модуляция мира) и
+    // уровень моря берём из активного мира конфига, а не из констант.
+    cfg.biomes   = _world->biomes;
+    cfg.seaLevel = _world->seaLevel;
 	_chunkMgr.init(cfg);
 
-    // Генерация мира — общий генератор (WorldGenerator.h): рельеф, пляжи,
-    // гравийные пятна и рудные жилы по глубине. Используется и в главном меню.
-    _chunkMgr.setOnGenerate([](ChunkData& chunk) { worldgen::generate(chunk); });
+    // Генерация мира — общий генератор (WorldGenerator.h): рельеф, бугры, озёра,
+    // пляжи, гравийные пятна и рудные жилы по профилю активного мира (с регионами).
+    // Используется и в главном меню. Лямбда захватывает WorldDef, принадлежащий
+    // каталогу сцены, — живёт до shutdown() чанк-менеджера в деструкторе.
+    const worldcfg::WorldDef* world = _world;
+    _chunkMgr.setOnGenerate([world](ChunkData& chunk) { worldgen::generate(chunk, *world); });
 
     // CameraFlag — маска USER1 на визуализируемые ноды
     _chunkMgr.setOnVisualize([this](ax::Node* node, const ChunkKey& key) {
@@ -172,7 +216,9 @@ bool GameScene::init()
     _playerController = FirstPersonController::create(_mainCamera, 10.0f, userMouseSens);
     AX_ASSERT(_playerController && "Failed to create FirstPersonController");
     _playerController->setChunkManager(&_chunkMgr);
-    _playerController->setInitialPosition(ax::Vec3(0.0f, 60.0f, 0.0f));
+    // Спавн — из конфига мира; высота — над максимумом рельефа, игрок опустится сам.
+    const float spawnY = std::min(_world->terrain.baseHeight + _world->terrain.amplitude + 24.0f, 240.0f);
+    _playerController->setInitialPosition(ax::Vec3(_world->spawnX, spawnY, _world->spawnZ));
     this->addChild(_playerController);
 
     _playerNode = _playerController;
@@ -415,6 +461,27 @@ void GameScene::setPlayerPosition(const ax::Vec3& pos)
         _playerController->setInitialPosition(pos);
     // Принудительно пересчитать видимые чанки вокруг новой позиции.
     _chunkMgr.forceUpdate();
+}
+
+// =========================================================================
+//  switchWorld — переход между мирами конфига (полный перезапуск сцены)
+// =========================================================================
+bool GameScene::switchWorld(const std::string& worldId)
+{
+    if (worldId.empty() || worldId == _worldId || !_worldCatalog.setActive(worldId))
+        return false;
+
+    // Запоминаем выбор: новая сцена (и следующий запуск игры) откроет этот мир.
+    auto* ud = ax::UserDefault::getInstance();
+    ud->setStringForKey(kKeyActiveWorld, worldId);
+    ud->flush();
+
+    AXLOGI("GameScene: переход в мир '{}'", worldId);
+    // Полный перезапуск сцены: деструктор остановит воркеры чанк-менеджера,
+    // новая сцена поднимется уже с сидом, профилем террейна и регионами
+    // нового мира. Игрок появится на спавне нового мира (сейв не трогаем).
+    ax::Director::getInstance()->replaceScene(GameScene::create());
+    return true;
 }
 
 // =========================================================================

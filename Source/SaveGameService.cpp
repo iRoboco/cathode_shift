@@ -24,6 +24,13 @@ bool SaveGameService::saveGame(GameScene* scene)
 
     doc.AddMember("version", kSaveVersion, alloc);
 
+    // Мир, в котором сделано сохранение: при «Продолжить» сцена поднимается
+    // сразу с этим миром (GameScene::createFromSave читает поле до init).
+    const std::string& worldId = scene->getWorldId();
+    rapidjson::Value worldIdVal;
+    worldIdVal.SetString(worldId.c_str(), static_cast<rapidjson::SizeType>(worldId.size()), alloc);
+    doc.AddMember("worldId", worldIdVal, alloc);
+
     const Vec3 pos = scene->getPlayerPosition();
     doc.AddMember("playerX", pos.x, alloc);
     doc.AddMember("playerY", pos.y, alloc);
@@ -59,6 +66,16 @@ bool SaveGameService::loadGame(GameScene* scene)
         return (doc.HasMember(key) && doc[key].IsNumber()) ? doc[key].GetFloat() : 0.0f;
     };
 
+    // Контроль соответствия мира: createFromSave поднимает сцену с миром из
+    // сейва, поэтому расхождение возможно лишь если мир удалили из конфига.
+    if (doc.HasMember("worldId") && doc["worldId"].IsString())
+    {
+        const std::string savedWorld = doc["worldId"].GetString();
+        if (!savedWorld.empty() && savedWorld != scene->getWorldId())
+            AXLOGW("SaveGameService: сейв из мира '{}', активен '{}' — позиция может не соответствовать местности",
+                   savedWorld, scene->getWorldId());
+    }
+
     const Vec3 pos{readFloat("playerX"), readFloat("playerY"), readFloat("playerZ")};
     scene->setPlayerPosition(pos);
     return true;
@@ -67,4 +84,18 @@ bool SaveGameService::loadGame(GameScene* scene)
 bool SaveGameService::hasSave()
 {
     return FileUtils::getInstance()->isFileExist(savePath());
+}
+
+std::string SaveGameService::readSavedWorldId()
+{
+    if (!hasSave())
+        return {};
+
+    const std::string json = FileUtils::getInstance()->getStringFromFile(savePath());
+    rapidjson::Document doc;
+    doc.Parse(json.c_str());
+    // Поле опциональное (формат v1 допускает сейвы без worldId).
+    if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("worldId") || !doc["worldId"].IsString())
+        return {};
+    return doc["worldId"].GetString();
 }

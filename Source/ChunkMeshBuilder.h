@@ -125,6 +125,8 @@ inline uint16_t getBlockTileIndex(uint16_t blockId, int face)
         return 9;  // золотая руда
     case BLOCK_CRYSTAL_ORE:
         return 10;  // кристаллическая руда
+    case BLOCK_SNOW:
+        return 11;  // снег (заготовка) на всех гранях
     default:
         return 0;  // fallback: use grass tile
     }
@@ -344,13 +346,15 @@ inline void buildWaterMesh(const ChunkData& data,
                            const ChunkData* neighborZ0,
                            const ChunkData* neighborZ1,
                            std::vector<ChunkVertex>& vertices,
-                           ax::IndexArray& indices)
+                           ax::IndexArray& indices,
+                           int seaLevel = 38)  ///< уровень моря активного мира (WorldConfig)
 {
     constexpr int CX = CHUNK_SIZE_X;
     constexpr int CY = CHUNK_SIZE_Y;
     constexpr int CZ = CHUNK_SIZE_Z;
-    // ⚠️ Должен совпадать с SEA_LEVEL в GameScene::init()
-    constexpr int SEA_LEVEL = 38;
+    // Уровень моря задаётся конфигом мира (ChunkManager::Config::seaLevel);
+    // значение по умолчанию 38 соответствует прежнему поведению.
+    const int SEA_LEVEL = seaLevel;
 
     // UV тайла воды (индекс 4 в атласе 4x4)
     auto [u, v, u2, v2] = calculateTileUV(4);
