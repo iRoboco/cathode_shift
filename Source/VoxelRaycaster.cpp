@@ -85,7 +85,6 @@ bool VoxelRaycasterNode::init(ax::Camera* camera, ChunkManager* mgr, float maxDi
 
     _highlightMaterial = createCachedMaterial();
     _previewMaterial   = createCachedMaterial();
-    _breakMaterial     = createCachedMaterial();
 
     auto setupCachedRenderer = [&](DynamicMeshRenderer*& renderer) {
         auto* dynRenderer = new (std::nothrow) DynamicMeshRenderer();
@@ -105,7 +104,6 @@ bool VoxelRaycasterNode::init(ax::Camera* camera, ChunkManager* mgr, float maxDi
 
     setupCachedRenderer(_faceHighlightRenderer);
     setupCachedRenderer(_placePreviewRenderer);
-    setupCachedRenderer(_breakProgressRenderer);
     _renderersInitialized = true;
 
     // ============================================================================
@@ -120,12 +118,26 @@ bool VoxelRaycasterNode::init(ax::Camera* camera, ChunkManager* mgr, float maxDi
                 "custom/highlight_vs", "custom/highlight_fs", ax::backend::VertexLayoutType::Unspec))
         {
             _highlightPS = new ax::backend::ProgramState(program);
-            _breakPS     = new ax::backend::ProgramState(program);
             const ax::Vec3 zero = ax::Vec3::ZERO;
-            for (auto* ps : {_highlightPS, _breakPS})
+            if (auto loc = _highlightPS->getUniformLocation("u_chunkOrigin"))
+                _highlightPS->setUniform(loc, &zero, sizeof(ax::Vec3));
+
+            // Материал прицела создаём ОДИН РАЗ из PS. Для каждого нового меша
+            // применяем setMaterial(this) — setMaterial() заменяет материал меша
+            // безусловно, в отличие от MeshRenderer::setProgramState(), который
+            // пропускает пропагацию, если Node уже хранит тот же PS (возврат false
+            // из Node::setProgramState) — свежий меш тогда оставался с материалом
+            // createMesh() и сэмплировал ВЕСЬ атлас UV'ками 0..1.
+            _highlightPSMaterial = ax::Material::createWithProgramState(_highlightPS);
+            if (_highlightPSMaterial)
             {
-                if (auto loc = ps->getUniformLocation("u_chunkOrigin"))
-                    ps->setUniform(loc, &zero, sizeof(ax::Vec3));
+                ax::BlendFunc blend{};
+                blend.src = ax::backend::BlendFactor::SRC_ALPHA;
+                blend.dst = ax::backend::BlendFactor::ONE_MINUS_SRC_ALPHA;
+                _highlightPSMaterial->getStateBlock().setBlendFunc(blend);
+                _highlightPSMaterial->getStateBlock().setDepthWrite(false);  // Не ломаем Z-буфер
+                _highlightPSMaterial->getStateBlock().setDepthTest(true);
+                _highlightPSMaterial->retain();
             }
         }
         else
@@ -146,10 +158,7 @@ void VoxelRaycasterNode::setInteractionMode(BlockInteractionMode mode)
     if (_mode != BlockInteractionMode::PlaceIntent)
         hidePlacePreview();
     if (_mode != BlockInteractionMode::BreakHold)
-    {
-        hideBreakProgress();
-        _breakProgress = 0.0f;  // Явный сброс прогресса при смене режима
-    }
+        _breakProgress = 0.0f;  // Явный сброс прогресса при смене режима (тайминг only)
 }
 
 // ============================================================================
@@ -195,17 +204,16 @@ void VoxelRaycasterNode::update(float dt)
     {
     case BlockInteractionMode::Look:
         hidePlacePreview();
-        hideBreakProgress();
         break;
 
     case BlockInteractionMode::PlaceIntent:
         updatePlacePreview(hit);
-        hideBreakProgress();
         break;
 
     case BlockInteractionMode::BreakHold:
         hidePlacePreview();
-        updateBreakProgress(hit);
+        // Прогресс разрушения визуально НЕ показываем (заполняющая грань
+        // исключена полностью) — остаётся только тайминг и пыль.
         // Спавн пыли при удержании
         _dustSpawnAccum += dt;
         if (_dustSpawnAccum >= 0.08f)
@@ -475,16 +483,12 @@ void VoxelRaycasterNode::cleanupParticles()
 
 void VoxelRaycasterNode::tickShaderUniforms()
 {
-    auto tick = [this](ax::backend::ProgramState* ps, const ax::Color4F& color) {
-        if (!ps)
-            return;
-        if (auto loc = ps->getUniformLocation("u_time"))
-            ps->setUniform(loc, &_animTime, sizeof(float));
-        if (auto loc = ps->getUniformLocation("u_tintColor"))
-            ps->setUniform(loc, &color, sizeof(ax::Color4F));
-    };
-    tick(_highlightPS, _faceColor);
-    tick(_breakPS, _breakColor);
+    if (!_highlightPS)
+        return;
+    if (auto loc = _highlightPS->getUniformLocation("u_time"))
+        _highlightPS->setUniform(loc, &_animTime, sizeof(float));
+    if (auto loc = _highlightPS->getUniformLocation("u_tintColor"))
+        _highlightPS->setUniform(loc, &_faceColor, sizeof(ax::Color4F));
 }
 
 // ============================================================================
@@ -523,7 +527,10 @@ ax::Mesh* VoxelRaycasterNode::createVoronoiFaceMesh(const VoxelHit& hit, float p
                                  static_cast<int>(hit.normal.z), pushOut, insetScale, vverts, vind))
         return nullptr;
 
-    return voronoi::createMesh(vverts, vind, _terrainAtlas);
+    // Подсветка — строго tint-only (шейдер highlight_* не сэмплирует текстуру),
+    // поэтому атлас в меш НЕ передаём: иначе при любом сбое привязки материала
+    // UV 0..1 грани растянули бы ВЕСЬ атлас по подсветке.
+    return voronoi::createMesh(vverts, vind, nullptr);
 }
 
 // ============================================================================
@@ -604,7 +611,8 @@ ax::Mesh* VoxelRaycasterNode::createFaceHighlightMesh(const VoxelHit& hit)
                 {x1 + e, y1 + e, z0 - e, u2, v2});
     }
 
-    return createMesh(verts, inds, _terrainAtlas);
+    // tint-only: атлас не передаём (см. createVoronoiFaceMesh).
+    return createMesh(verts, inds, nullptr);
 }
 
 // ============================================================================
@@ -652,81 +660,10 @@ ax::Mesh* VoxelRaycasterNode::createPlacePreviewMesh(const VoxelHit& hit)
 }
 
 // ============================================================================
-//  Меш-билдинг: прогресс разрушения (заполняющаяся грань)
+//  Меш-билдинг: прогресс разрушения — ИСКЛЮЧЁН (заполняющаяся грань удалена).
+//  Тайминг удержания по-прежнему ведёт FirstPersonController (BREAK_TIME),
+//  затем вызывается breakBlock() — без визуального индикатора.
 // ============================================================================
-
-ax::Mesh* VoxelRaycasterNode::createBreakProgressMesh(const VoxelHit& hit, float progress)
-{
-    if (progress <= 0.0f)
-        return nullptr;
-
-    // Воронои-путь: реальная грань, сжатая к центроиду пропорционально прогрессу
-    // (+0.006 по нормали — выше подсветки, чтобы не слипаться с ней)
-    if (auto* mesh = createVoronoiFaceMesh(hit, 0.006f, progress))
-    {
-        _breakMeshIsVoronoi = true;
-        return mesh;
-    }
-    _breakMeshIsVoronoi = false;
-
-    Vec3 center(static_cast<float>(hit.bx) + 0.5f + hit.normal.x * 0.003f,
-                static_cast<float>(hit.by) + 0.5f + hit.normal.y * 0.003f,
-                static_cast<float>(hit.bz) + 0.5f + hit.normal.z * 0.003f);
-
-    float s = progress;
-
-    std::vector<ChunkVertex> verts;
-    ax::IndexArray inds;
-
-    int face            = hit.normal.y > 0.5f    ? 2
-                          : hit.normal.y < -0.5f ? 3
-                          : hit.normal.x > 0.5f  ? 0
-                          : hit.normal.x < -0.5f ? 1
-                          : hit.normal.z > 0.5f  ? 4
-                                                 : 5;
-    auto [u, v, u2, v2] = calculateTileUV(getBlockTileIndex(hit.blockId, face));
-
-    Vec3 right, up;
-    if (std::abs(hit.normal.x) > 0.5f)
-    {
-        right = Vec3(0, 0, 1);
-        up    = Vec3(0, 1, 0);
-    }
-    else if (std::abs(hit.normal.y) > 0.5f)
-    {
-        right = Vec3(1, 0, 0);
-        up    = Vec3(0, 0, 1);
-    }
-    else
-    {
-        right = Vec3(1, 0, 0);
-        up    = Vec3(0, 1, 0);
-    }
-
-    Vec3 p0 = center - right * (0.5f * s) - up * (0.5f * s);
-    Vec3 p1 = center + right * (0.5f * s) - up * (0.5f * s);
-    Vec3 p2 = center + right * (0.5f * s) + up * (0.5f * s);
-    Vec3 p3 = center - right * (0.5f * s) + up * (0.5f * s);
-
-    p0 += hit.normal * 0.001f;
-    p1 += hit.normal * 0.001f;
-    p2 += hit.normal * 0.001f;
-    p3 += hit.normal * 0.001f;
-
-    verts.push_back({p0.x, p0.y, p0.z, u, v});
-    verts.push_back({p1.x, p1.y, p1.z, u2, v});
-    verts.push_back({p2.x, p2.y, p2.z, u2, v2});
-    verts.push_back({p3.x, p3.y, p3.z, u, v2});
-
-    inds.emplace_back<uint16_t>(0);
-    inds.emplace_back<uint16_t>(1);
-    inds.emplace_back<uint16_t>(2);
-    inds.emplace_back<uint16_t>(0);
-    inds.emplace_back<uint16_t>(2);
-    inds.emplace_back<uint16_t>(3);
-
-    return createMesh(verts, inds, _terrainAtlas);
-}
 
 // ============================================================================
 //  Обновление рендереров
@@ -751,13 +688,15 @@ void VoxelRaycasterNode::updateFaceHighlight(const VoxelHit& hit)
 
         // Применяем кэшированный материал ПОСЛЕ добавления меша.
         // Если вызвать setMaterial() до addMesh(), массив _meshes пуст и вызов будет no-op.
-        if (_highlightMaterial)
+        // Воронои-путь: материал из ProgramState прицела (tint-only шейдер).
+        // Сеточный откат (нет a_texCoord1/2 для шейдера): обычный UNLIT.
+        // ВАЖНО: только setMaterial() — MeshRenderer::setProgramState() не используем:
+        // при неизменном PS Node::setProgramState() возвращает false и шейдер не
+        // доходит до свежего меша (меш оставался с материалом createMesh() с атласом).
+        if (_faceMeshIsVoronoi && _highlightPSMaterial)
+            _faceHighlightRenderer->setMaterial(_highlightPSMaterial);
+        else if (_highlightMaterial)
             _faceHighlightRenderer->setMaterial(_highlightMaterial);
-        // Шейдер прицела поверх материала (render-state сохраняется, как у чанков).
-        // Только для воронои-меша: у сеточного квада (ChunkVertex) нет атрибутов
-        // a_texCoord1/2 — он остаётся на встроенном UNLIT.
-        if (_highlightPS && _faceMeshIsVoronoi)
-            _faceHighlightRenderer->setProgramState(_highlightPS);
 
         _faceHighlightRenderer->setVisible(true);  // Показываем ноду
 
@@ -801,37 +740,6 @@ void VoxelRaycasterNode::updatePlacePreview(const VoxelHit& hit)
     }
 }
 
-void VoxelRaycasterNode::updateBreakProgress(const VoxelHit& hit)
-{
-    // Если прогресс сброшен или равен нулю, скрываем индикатор и выходим
-    if (_breakProgress <= 0.0f)
-    {
-        _breakProgressRenderer->setVisible(false);
-        return;
-    }
-
-    if (auto* mesh = createBreakProgressMesh(hit, _breakProgress))
-    {
-        _breakProgressRenderer->clearMeshes();  // Безопасная очистка
-        _breakProgressRenderer->addMesh(mesh);
-        if (_breakMaterial)
-            _breakProgressRenderer->setMaterial(_breakMaterial);
-        // Воронои-меш прогресса — тем же шейдером прицела (синхронная анимация)
-        if (_breakPS && _breakMeshIsVoronoi)
-            _breakProgressRenderer->setProgramState(_breakPS);
-        _breakProgressRenderer->setVisible(true);
-
-        _breakProgressRenderer->setColor(ax::Color3B(static_cast<uint8_t>(_breakColor.r * 255),
-                                                     static_cast<uint8_t>(_breakColor.g * 255),
-                                                     static_cast<uint8_t>(_breakColor.b * 255)));
-        _breakProgressRenderer->setOpacity(static_cast<uint8_t>(_breakColor.a * 255));
-    }
-    else
-    {
-        _breakProgressRenderer->setVisible(false);
-    }
-}
-
 // ============================================================================
 //  Скрытие рендереров
 // ============================================================================
@@ -851,17 +759,10 @@ void VoxelRaycasterNode::hidePlacePreview()
         _placePreviewRenderer->setVisible(false);
 }
 
-void VoxelRaycasterNode::hideBreakProgress()
-{
-    if (_breakProgressRenderer)
-        _breakProgressRenderer->setVisible(false);
-}
-
 void VoxelRaycasterNode::hideAll()
 {
     hideFaceHighlight();
     hidePlacePreview();
-    hideBreakProgress();
 }
 
 // ============================================================================
@@ -950,9 +851,7 @@ VoxelRaycasterNode::~VoxelRaycasterNode()
     // [MEMORY] Axmol использует ручной подсчёт ссылок.
     // Кэшированные материалы требуют явного release() при уничтожении ноды.
     AX_SAFE_RELEASE_NULL(_highlightMaterial);
+    AX_SAFE_RELEASE_NULL(_highlightPSMaterial);
     AX_SAFE_RELEASE_NULL(_previewMaterial);
-    AX_SAFE_RELEASE_NULL(_breakMaterial);
-    // ProgramState шейдера прицела — тоже retain'ились в init()
     AX_SAFE_RELEASE_NULL(_highlightPS);
-    AX_SAFE_RELEASE_NULL(_breakPS);
 }

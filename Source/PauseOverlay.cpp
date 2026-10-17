@@ -40,6 +40,14 @@ bool PauseOverlay::initWithOwner(GameScene* owner)
 
     _owner = owner;
 
+    // Один раз читаем текущие значения (дальше — кэш, см. PauseOverlay.h).
+    {
+        auto* ud  = UserDefault::getInstance();
+        _aa       = ud->getBoolForKey(kKeyPixelArtAA, true);
+        _pixelate = ud->getBoolForKey(kKeyTilePixelate, false);
+        _pixelRes = static_cast<int>(ud->getFloatForKey(kKeyTilePixelRes, 32.0f));
+    }
+
     // ImGui уже настроен (GameScene::onEnter вызывает ui_theme::setup()),
     // но вызов идемпотентен — на случай прямого входа в паузу подстрахуемся.
     ui_theme::setup();
@@ -82,25 +90,21 @@ void PauseOverlay::onDrawPauseMenu()
     ImGui::Dummy(ImVec2(0.0f, 20.0f));
 
     // --- Графика: переключатель pixel-art AA (применяется вживую) ---
-    {
-        bool aa = UserDefault::getInstance()->getBoolForKey(kKeyPixelArtAA, true);
-        if (ImGui::Checkbox("Сглаживание пикселей (AA)", &aa) && _owner)
-            _owner->setPixelArtAA(aa);  // живое применение + сохранение
-    }
+    if (ImGui::Checkbox("Сглаживание пикселей (AA)", &_aa) && _owner)
+        _owner->setPixelArtAA(_aa);  // живое применение + сохранение
 
     // --- Графика: пикселизация тайлов (ретро-режим), применяется вживую ---
     // Uniform-only: переключение мгновенное, без ребилда чанков. В игре та же
     // функция на клавише P.
+    if (ImGui::Checkbox("Пикселизация тайлов (ретро)", &_pixelate) && _owner)
+        _owner->setTilePixelate(_pixelate);  // живое применение + сохранение
+    if (_pixelate)
     {
-        bool px = UserDefault::getInstance()->getBoolForKey(kKeyTilePixelate, false);
-        if (ImGui::Checkbox("Пикселизация тайлов (ретро)", &px) && _owner)
-            _owner->setTilePixelate(px);  // живое применение + сохранение
-        if (px)
-        {
-            int res = static_cast<int>(UserDefault::getInstance()->getFloatForKey(kKeyTilePixelRes, 32.0f));
-            if (ImGui::SliderInt("Разрешение тайлов", &res, 8, 64) && _owner)
-                _owner->setTilePixelRes(static_cast<float>(res));
-        }
+        if (ImGui::SliderInt("Разрешение тайлов", &_pixelRes, 8, 64) && _owner)
+            _owner->setTilePixelRes(static_cast<float>(_pixelRes));  // вживую, без записи на диск
+        // Запись настроек на диск — один раз при отпускании слайдера, а не каждый кадр drag.
+        if (ImGui::IsItemDeactivatedAfterEdit())
+            UserDefault::getInstance()->flush();
     }
     ImGui::Dummy(ImVec2(0.0f, 12.0f));
 

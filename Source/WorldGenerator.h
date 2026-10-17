@@ -12,8 +12,9 @@
  *
  * Все параметры — из worldcfg::WorldDef: сиды шумов производны от world.seed,
  * рельеф/материалы/руды/уровень моря настраиваются в worlds.json. МАКРО-регионы
- * мира (кольца от спавна, широтные полосы) блендятся по колонке через
- * WorldDef::sampleTerrain / sampleMaterials — плавные переходы без швов.
+ * мира (кольца от спавна, широтные полосы): ВЫСОТА колонки = Σ вес_i · высота_i
+ * (columnHeight — у каждого региона свои частоты/октавы, смешиваются результаты,
+ * а не параметры шума → переходы без швов); материалы — от доминирующего региона.
  *
  * Слои мира (сверху вниз):
  *   • Поверхность: каменные выступы → песчаное дно/пляжи у воды → гравийные
@@ -41,6 +42,94 @@ inline const std::vector<worldcfg::OreRule>& defaultOres()
     return ores;
 }
 
+// ============================================================================
+//  Высота рельефа: смешиваем ВЫСОТЫ регионов, а не их параметры
+// ============================================================================
+
+/// Шумы, определяющие высоту поверхности (производны от сида мира).
+struct TerrainNoise
+{
+    siv::PerlinNoise perlin;  ///< рельеф + крупный «биомный» сдвиг
+    siv::PerlinNoise hills;   ///< бугорки равнин
+    siv::PerlinNoise lake;    ///< озёрные котловины
+    explicit TerrainNoise(uint32_t seed) : perlin(seed), hills(seed + 613), lake(seed + 719) {}
+};
+
+/// Высота (float) по ОДНОМУ профилю рельефа — со своими частотой/октавами/порогами.
+inline float profileHeight(const TerrainNoise& tn, const worldcfg::TerrainProfile& tp, float wx, float wz,
+                           bool lakesAllowed)
+{
+    const float terrain =
+        tn.perlin.octave2D_01(wx * tp.terrainFreq, wz * tp.terrainFreq, tp.octaves) * tp.amplitude;
+    const float macro =
+        tn.perlin.octave2D_01(wx * tp.macroFreq, wz * tp.macroFreq, tp.macroOctaves) * tp.macroOffset + tp.macroShift;
+    float h = terrain + macro + tp.baseHeight;
+
+    // Бугорки (равнины): пороговый шум добавляет локальные холмики.
+    if (tp.hills.amplitude > 0.0f)
+    {
+        const float hn = tn.hills.octave2D_01(wx * tp.hills.freq, wz * tp.hills.freq, 3);
+        if (hn > tp.hills.threshold)
+            h += (hn - tp.hills.threshold) / (1.0f - tp.hills.threshold) * tp.hills.amplitude;
+    }
+
+    // Озёра: редкие котловины ниже уровня моря.
+    if (tp.lakes.enabled && lakesAllowed)
+    {
+        const float ln = tn.lake.octave2D_01(wx * tp.lakes.freq, wz * tp.lakes.freq, 3);
+        if (ln > tp.lakes.threshold)
+            h -= (ln - tp.lakes.threshold) / (1.0f - tp.lakes.threshold) * tp.lakes.depth;
+    }
+    return h;
+}
+
+/// Высота колонки = Σ вес_i · высота_i по профилям с ненулевым весом (база + регионы).
+/// Это непрерывная функция позиции: на границах регионов нет обрывов, даже если у
+/// регионов разные terrainFreq/octaves/пороги (смешивать параметры шума нельзя:
+/// при смене частоты значение шума в точке меняется скачком).
+inline float columnHeight(const TerrainNoise& tn, const worldcfg::WorldDef& world,
+                          const worldcfg::WorldDef::ColumnWeights& col, float wx, float wz, bool lakesAllowed)
+{
+    float h = 0.0f;
+    if (col.baseW > 0.0f)
+        h += col.baseW * profileHeight(tn, world.terrain, wx, wz, lakesAllowed);
+    for (int i = 0; i < col.n; ++i)
+        if (col.w[i] > 0.0f)
+            h += col.w[i] * profileHeight(tn, world.regions[i].terrain, wx, wz, lakesAllowed);
+    return h;
+}
+
+/// Y верхнего блока поверхности в колонке (wx, wz) — ровно то, что строит generate().
+inline int surfaceHeight(const TerrainNoise& tn, const worldcfg::WorldDef& world, double wx, double wz)
+{
+    const bool lakes = world.waterEnabled && world.seaLevel >= 0;
+    const auto col   = world.sampleColumn(wx, wz);
+    const float h    = columnHeight(tn, world, col, static_cast<float>(wx), static_cast<float>(wz), lakes);
+    return std::clamp(static_cast<int>(h), 1, CHUNK_SIZE_Y - 2);
+}
+
+inline int surfaceHeight(const worldcfg::WorldDef& world, double wx, double wz)
+{
+    const TerrainNoise tn(world.seed);
+    return surfaceHeight(tn, world, wx, wz);
+}
+
+/// Y, на котором ставим ноги игрока на спавне мира: над ВЫШЕЙ поверхностью из
+/// 3×3 колонок вокруг спавна (капсула шире одной колонки) и не ниже воды.
+/// Реальный рельеф (с регионами), а не оценка по базовому профилю.
+inline float spawnHeight(const worldcfg::WorldDef& world)
+{
+    const TerrainNoise tn(world.seed);
+    int top = 0;
+    for (int dz = -1; dz <= 1; ++dz)
+        for (int dx = -1; dx <= 1; ++dx)
+            top = std::max(top, surfaceHeight(tn, world, world.spawnX + dx, world.spawnZ + dz));
+    if (world.waterEnabled)
+        top = std::max(top, world.seaLevel);
+    // +1: верх блока; +2: небольшой зазор, чтобы игрок мягко опустился на землю.
+    return static_cast<float>(std::min(top + 1 + 2, CHUNK_SIZE_Y - 2));
+}
+
 /**
  * @brief Заполняет чанк блоками по профилю мира. Детерминированно по мировым
  *        координатам и world.seed (чистая функция — безопасно в воркерах).
@@ -54,13 +143,11 @@ inline void generate(ChunkData& chunk, const worldcfg::WorldDef& world)
     // Сиды шумов производны от сида мира — у каждого мира свой рельеф.
     // Пересоздание PerlinNoise — это лишь тасование таблицы 256 байт, дёшево
     // на фоне генерации чанка.
-    siv::PerlinNoise perlin(world.seed);            // рельеф + крупный «биомный» сдвиг
+    const TerrainNoise terrainNoise(world.seed);    // рельеф, бугры, озёра
     siv::PerlinNoise rockNoise(world.seed + 137);   // каменные выступы
     siv::PerlinNoise dirtNoise(world.seed + 271);   // земляная корка
     siv::PerlinNoise sandNoise(world.seed + 311);   // пляжи и песчаное дно
     siv::PerlinNoise gravelNoise(world.seed + 397); // гравийные пятна
-    siv::PerlinNoise hillsNoise(world.seed + 613);  // бугорки равнин
-    siv::PerlinNoise lakeNoise(world.seed + 719);   // озёрные котловины
     // 3D-шумы жил (до 8 правил руд; лишние правила делят последний шум)
     std::array<siv::PerlinNoise, 8> ore3D = {siv::PerlinNoise(world.seed + 401), siv::PerlinNoise(world.seed + 503),
                                              siv::PerlinNoise(world.seed + 509), siv::PerlinNoise(world.seed + 521),
@@ -73,34 +160,13 @@ inline void generate(ChunkData& chunk, const worldcfg::WorldDef& world)
             const float wx = basePos.x + x;
             const float wz = basePos.z + z;
 
-            // --- МАКРО: региональный профиль точки (плавный блендинг) ---
-            const worldcfg::TerrainProfile tp      = world.sampleTerrain(wx, wz);
-            const worldcfg::MaterialPalette& mp    = world.sampleMaterials(wx, wz);
+            // --- МАКРО: веса регионов колонки (считаются один раз) ---
+            const auto col                         = world.sampleColumn(wx, wz);
+            const worldcfg::MaterialPalette& mp    = world.materialsOf(col);
             const std::vector<worldcfg::OreRule>& ores = mp.ores.empty() ? defaultOres() : mp.ores;
 
-            // --- Рельеф ---
-            const float terrain =
-                perlin.octave2D_01(wx * tp.terrainFreq, wz * tp.terrainFreq, tp.octaves) * tp.amplitude;
-            const float macro =
-                perlin.octave2D_01(wx * tp.macroFreq, wz * tp.macroFreq, tp.macroOctaves) * tp.macroOffset +
-                tp.macroShift;
-            float h = terrain + macro + tp.baseHeight;
-
-            // Бугорки (равнины): пороговый шум добавляет локальные холмики.
-            if (tp.hills.amplitude > 0.0f)
-            {
-                const float hn = hillsNoise.octave2D_01(wx * tp.hills.freq, wz * tp.hills.freq, 3);
-                if (hn > tp.hills.threshold)
-                    h += (hn - tp.hills.threshold) / (1.0f - tp.hills.threshold) * tp.hills.amplitude;
-            }
-
-            // Озёра: редкие котловины ниже уровня моря.
-            if (tp.lakes.enabled && seaLevel >= 0)
-            {
-                const float ln = lakeNoise.octave2D_01(wx * tp.lakes.freq, wz * tp.lakes.freq, 3);
-                if (ln > tp.lakes.threshold)
-                    h -= (ln - tp.lakes.threshold) / (1.0f - tp.lakes.threshold) * tp.lakes.depth;
-            }
+            // --- Рельеф: высоты регионов смешиваются по весам (без швов) ---
+            const float h = columnHeight(terrainNoise, world, col, wx, wz, seaLevel >= 0);
 
             const int surfaceY = std::clamp(static_cast<int>(h), 1, CHUNK_SIZE_Y - 2);
 

@@ -280,12 +280,13 @@ public:
     BlockInteractionMode getInteractionMode() const noexcept { return _mode; }
 
     // === Прогресс разрушения [0..1] ===
+    // Хранится для тайминга (контроллер накапливает hold), ВИЗУАЛЬНО не отображается:
+    // заполняющая грань (break progress fill) полностью исключена из рендера.
     void setBreakProgress(float t) noexcept { _breakProgress = std::clamp(t, 0.0f, 1.0f); }
 
     // === Цвета подсветки ===
     void setFaceHighlightColor(const ax::Color4F& c) noexcept { _faceColor = c; }
     void setPlacePreviewColor(const ax::Color4F& c) noexcept { _previewColor = c; }
-    void setBreakProgressColor(const ax::Color4F& c) noexcept { _breakColor = c; }
 
     // Управление видимостью превью блока
     void setPlacePreviewVisible(bool visible) noexcept { _placePreviewVisible = visible; }
@@ -314,11 +315,9 @@ private:
     void tickShaderUniforms();
     void updateFaceHighlight(const VoxelHit& hit);
     void updatePlacePreview(const VoxelHit& hit);
-    void updateBreakProgress(const VoxelHit& hit);
 
     void hideFaceHighlight();
     void hidePlacePreview();
-    void hideBreakProgress();
     void hideAll();
 
     // === Меш-билдинг ===
@@ -326,13 +325,17 @@ private:
     ax::Mesh* createVoronoiFaceMesh(const VoxelHit& hit, float pushOut, float insetScale);
     ax::Mesh* createFaceHighlightMesh(const VoxelHit& hit);
     ax::Mesh* createPlacePreviewMesh(const VoxelHit& hit);
-    ax::Mesh* createBreakProgressMesh(const VoxelHit& hit, float progress);
 
     // Материалы кэшируются отдельно. Применяются только после addMesh(),
     // так как setMaterial() в Axmol работает только с существующими мешами в _meshes.
-    ax::Material* _highlightMaterial = nullptr;
-    ax::Material* _previewMaterial   = nullptr;
-    ax::Material* _breakMaterial     = nullptr;
+    // _highlightPSMaterial — материал, созданный ОДИН РАЗ из ProgramState прицела.
+    // Намеренно НЕ используем MeshRenderer::setProgramState() при каждом хите:
+    // Node::setProgramState() возвращает false для уже установленного PS и шейдер
+    // не пропагируется на свежедобавленный меш (плюс меш createMesh() нёс атлас
+    // и при незаписанном материале сэмплировал весь атлас UV'ками 0..1).
+    ax::Material* _highlightMaterial   = nullptr;
+    ax::Material* _highlightPSMaterial = nullptr;
+    ax::Material* _previewMaterial     = nullptr;
 
     ~VoxelRaycasterNode() override;  // Для безопасного release() кэшированных материалов
 
@@ -369,7 +372,6 @@ private:
     // Заменяем тип указателей на наш наследник
     DynamicMeshRenderer* _faceHighlightRenderer = nullptr;
     DynamicMeshRenderer* _placePreviewRenderer  = nullptr;
-    DynamicMeshRenderer* _breakProgressRenderer = nullptr;
 
     // Кэш последнего хита для предотвращения пересоздания мешей каждый кадр
     VoxelHit _lastFaceHighlightHit{};
@@ -378,17 +380,16 @@ private:
     // ============================================================================
     //  Прицел по реальной грани (воронои/желе террейн)
     //
-    //  Когда включён voronoiTerrain, геометрия подсветки и прогресса разрушения
-    //  строится voronoi::buildBlockFace() — точная ячейка Вороного + желейное
-    //  смещение. Анимация (дрожание желе, покачивание травы) повторяется шейдером
+    //  Когда включён voronoiTerrain, геометрия подсветки строится
+    //  voronoi::buildBlockFace() — точная ячейка Вороного + желейное смещение.
+    //  Анимация (дрожание желе, покачивание травы) повторяется шейдером
     //  custom/highlight_* синхронно с террейном: _animTime тикает тем же dt,
     //  что часы GameScene. Если программа не собрана — откат на сеточный квад.
+    //  Подсветка — строго tint-only: ни меш, ни материал атлас не содержат.
     // ============================================================================
-    ax::backend::ProgramState* _highlightPS = nullptr;  ///< retain'ится, общий для highlight
-    ax::backend::ProgramState* _breakPS     = nullptr;  ///< retain'ится, для прогресса
+    ax::backend::ProgramState* _highlightPS = nullptr;  ///< retain'ится
     float _animTime = 0.0f;                             ///< часы анимации шейдера прицела
-    bool _faceMeshIsVoronoi  = false;                   ///< последний highlight-меш — воронои?
-    bool _breakMeshIsVoronoi = false;                   ///< последний progress-меш — воронои?
+    bool _faceMeshIsVoronoi = false;                    ///< последний highlight-меш — воронои?
 
     // Флаг видимости превью
     bool _placePreviewVisible = true;
@@ -403,7 +404,6 @@ private:
     // Цвета
     ax::Color4F _faceColor{1.0f, 1.0f, 1.0f, 0.25f};
     ax::Color4F _previewColor{0.2f, 0.9f, 0.2f, 0.2f};
-    ax::Color4F _breakColor{1.0f, 0.3f, 0.1f, 0.5f};
 
     ax::Texture2D* _terrainAtlas = nullptr;
 
@@ -451,6 +451,5 @@ private:
     int _lastParticleSpawnBx = INT_MIN;
     int _lastParticleSpawnBy = INT_MIN;
     int _lastParticleSpawnBz = INT_MIN;
-    float _lastBreakProgress = 0.0f;
     float _dustSpawnAccum    = 0.0f;  // накопитель для спавна пыли
 };

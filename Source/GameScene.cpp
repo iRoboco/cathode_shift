@@ -140,12 +140,14 @@ bool GameScene::initWithWorldId(const std::string& worldId)
         const std::string worldsJson = FileUtils::getInstance()->getStringFromFile("config/worlds.json");
         if (worldsJson.empty() || !_worldCatalog.loadFromString(worldsJson))
             AXLOGW("GameScene: config/worlds.json не загружен — аварийный мир по умолчанию");
+        for (const auto& w : _worldCatalog.warnings())
+            AXLOGW("GameScene: worlds.json: {}", w);
 
         if (!worldId.empty())
             _worldCatalog.setActive(worldId);  // неизвестный id молча игнорируется
         else
         {
-            const std::string lastWorld{ud->getStringForKey(kKeyActiveWorld, "")};  // string_view → string (explicit)
+            const std::string lastWorld{ud->getStringForKey(kKeyActiveWorld, "")};
             if (!lastWorld.empty())
                 _worldCatalog.setActive(lastWorld);
         }
@@ -216,8 +218,10 @@ bool GameScene::initWithWorldId(const std::string& worldId)
     _playerController = FirstPersonController::create(_mainCamera, 10.0f, userMouseSens);
     AX_ASSERT(_playerController && "Failed to create FirstPersonController");
     _playerController->setChunkManager(&_chunkMgr);
-    // Спавн — из конфига мира; высота — над максимумом рельефа, игрок опустится сам.
-    const float spawnY = std::min(_world->terrain.baseHeight + _world->terrain.amplitude + 24.0f, 240.0f);
+    // Спавн — из конфига мира; высота — по РЕАЛЬНОМУ рельефу колонки спавна (с учётом
+    // регионов), а не по оценке базового профиля: в горах оценка оказывалась ниже земли.
+    // Пока чанк под игроком не загружен, контроллер держит его на месте (см. update).
+    const float spawnY = worldgen::spawnHeight(*_world);
     _playerController->setInitialPosition(ax::Vec3(_world->spawnX, spawnY, _world->spawnZ));
     this->addChild(_playerController);
 
@@ -344,29 +348,36 @@ void GameScene::update(float dt)
 {
     Scene::update(dt);
 
-    // На паузе мир заморожен: не двигаем чанки/воду/игрока. Рендер и меню ImGui
-    // продолжают работать (ImGui рисуется вне планировщика), поэтому FPS не падает.
-    if (_paused)
-        return;
+    // На паузе замораживается ГЕЙМПЛЕЙ (время анимации, погружение, игрок), но НЕ
+    // рендер-часть: униформы шейдеров (пикселизация тайлов) и ChunkManager::update
+    // продолжают работать. Иначе переключатели графики в меню паузы не давали
+    // видимого эффекта до выхода из паузы (AA помечает чанки dirty, а ребилд идёт
+    // только из ChunkManager::update) — меню казалось «запаздывающим», а после
+    // «Продолжить» случался всплеск пересборки всех чанков.
+    const bool paused = _paused;
 
     // === Анимация воды и детектирование погружения ===
-    _animTime += dt;
+    if (!paused)
+        _animTime += dt;
 
     // Определяем, погружена ли камера в воду по позиции глаз игрока.
     // Глаза располагаются на высоте 0.85 × высота капсулы (1.8) = ~1.53 над подошвой.
-    bool newUnderwater = false;
-    if (_playerController)
+    if (!paused)
     {
-        ax::Vec3 eyePos  = _playerController->getPlayerPosition() + ax::Vec3(0.0f, 1.53f, 0.0f);
-        BlockId eyeBlock = _chunkMgr.getBlockAtWorldPos(eyePos);
-        newUnderwater    = (eyeBlock == BLOCK_WATER);
+        bool newUnderwater = false;
+        if (_playerController)
+        {
+            ax::Vec3 eyePos  = _playerController->getPlayerPosition() + ax::Vec3(0.0f, 1.53f, 0.0f);
+            BlockId eyeBlock = _chunkMgr.getBlockAtWorldPos(eyePos);
+            newUnderwater    = (eyeBlock == BLOCK_WATER);
+        }
+        _cameraUnderwater = newUnderwater;
     }
-    _cameraUnderwater = newUnderwater;
 
     // === Подводный оверлей — плавный синезелёный тинт поверх экрана ===
     // Не трогаем terrain-ноды или материалы: LayerColor — чистый 2D без Z-буфера,
     // не имеет никакого влияния на 3D depth/blending.
-    if (_underwaterOverlay)
+    if (_underwaterOverlay && !paused)
     {
         // Плавный переход: 5 ед./сек → полное погружение за ~0.2 сек
         constexpr float BLEND_SPEED = 5.0f;
@@ -553,7 +564,9 @@ void GameScene::setTilePixelRes(float px)
     _chunkMgr.setTilePixelRes(px);
     auto* ud = ax::UserDefault::getInstance();
     ud->setFloatForKey(kKeyTilePixelRes, _chunkMgr.getTilePixelRes());
-    ud->flush();
+    // Без flush(): слайдер вызывает сеттер КАЖДЫЙ кадр перетаскивания, а flush —
+    // синхронная запись на диск. Сбрасываем один раз при отпускании (PauseOverlay)
+    // и при выходе из паузы (resumeGame).
 }
 
 // =========================================================================

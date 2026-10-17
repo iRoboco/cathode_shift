@@ -33,4 +33,11 @@ private:
 
     GameScene* _owner   = nullptr;
     bool _loopRegistered = false;  ///< Зарегистрирован ли ещё render loop (для идемпотентного снятия)
+
+    // Кэш настроек графики: onDrawPauseMenu вызывается КАЖДЫЙ кадр, читать
+    // UserDefault по ключу три раза за кадр незачем — источник правды после
+    // инициализации это состояние виджетов, а запись идёт через GameScene::set*.
+    bool _aa       = true;
+    bool _pixelate = false;
+    int _pixelRes  = 32;
 };

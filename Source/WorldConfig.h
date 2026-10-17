@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <climits>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -37,6 +38,13 @@
  */
 namespace worldcfg
 {
+
+/// Максимум регионов в мире. Лишние при парсинге отбрасываются (с предупреждением):
+/// веса лежат в стековых массивах float[kMaxRegions] в горячем пути генерации.
+constexpr size_t kMaxRegions = 16;
+
+/// Минимальная ширина blend, блоков: blend <= 0 дал бы деление на ноль в bandWeight.
+constexpr float kMinBlend = 1.0f;
 
 // ============================================================================
 //  Погода (ЗАГОТОВКА под северные/южные регионы: снег, дождь)
@@ -187,11 +195,12 @@ struct WorldDef : public biome::IRegionModulator
 
     // ---- Региональный сэмплинг (чистые функции позиции, потокобезопасно) ----
 
-    static float smooth01(float t) { return t <= 0 ? 0 : (t >= 1 ? 1 : t * t * (3 - 2 * t)); }
+    static float smooth01(float t) { return !(t > 0) ? 0 : (t >= 1 ? 1 : t * t * (3 - 2 * t)); }  // NaN → 0
 
     /// Вес региона в точке: полоса [min,max] со smooth-границами шириной blend.
     static float bandWeight(float v, float vMin, float vMax, float blend)
     {
+        blend = std::max(blend, kMinBlend);  // защита от деления на 0 (blend: 0 в JSON)
         float w = 1.0f;
         if (vMin > -1e29f)
             w *= smooth01((v - (vMin - blend)) / (2.0f * blend));
@@ -207,12 +216,13 @@ struct WorldDef : public biome::IRegionModulator
         {
             const double dx = wx - spawnX, dz = wz - spawnZ;
             const float dist = static_cast<float>(std::sqrt(dx * dx + dz * dz));
+            const float bl   = std::max(r.blend, kMinBlend);
             if (r.rMin <= 0.0f)
             {
                 // Кольцо от центра: внутренней кромки нет (dist >= 0 всегда) —
                 // иначе спавн получал бы половинный вес от внутренней ramp'ы.
                 if (r.rMax < 1e29f)
-                    w *= 1.0f - smooth01((dist - (r.rMax - r.blend)) / (2.0f * r.blend));
+                    w *= 1.0f - smooth01((dist - (r.rMax - bl)) / (2.0f * bl));
             }
             else
                 w *= bandWeight(dist, r.rMin, r.rMax, r.blend);
@@ -225,22 +235,54 @@ struct WorldDef : public biome::IRegionModulator
     }
 
     /// Веса регионов в точке; возвращает вес БАЗОВОГО профиля мира (остаток).
-    /// outW должен иметь размер regions.size().
+    /// outW — минимум kMaxRegions элементов; заполняются первые min(regions.size(), kMaxRegions).
     float regionWeights(double wx, double wz, float* outW) const
     {
-        float sum = 0.0f;
-        for (size_t i = 0; i < regions.size(); ++i)
+        const size_t n = std::min(regions.size(), kMaxRegions);
+        float sum      = 0.0f;
+        for (size_t i = 0; i < n; ++i)
         {
             outW[i] = regionWeight(regions[i], wx, wz);
             sum += outW[i];
         }
         if (sum > 1.0f)  // перекрытие регионов: нормализуем, база получает 0
         {
-            for (size_t i = 0; i < regions.size(); ++i)
+            for (size_t i = 0; i < n; ++i)
                 outW[i] /= sum;
             return 0.0f;
         }
         return 1.0f - sum;
+    }
+
+    /// Веса колонки (wx, wz): вычисляются ОДИН раз и переиспользуются генератором
+    /// для рельефа, материалов и т.д. Σ baseW + w[i] = 1.
+    struct ColumnWeights
+    {
+        float baseW = 1.0f;
+        float w[kMaxRegions] = {};
+        int n   = 0;   ///< число учтённых регионов
+        int dom = -1;  ///< доминирующий регион (-1 = базовый профиль мира)
+    };
+
+    ColumnWeights sampleColumn(double wx, double wz) const
+    {
+        ColumnWeights c;
+        c.n     = static_cast<int>(std::min(regions.size(), kMaxRegions));
+        c.baseW = regionWeights(wx, wz, c.w);
+        float domW = c.baseW;
+        for (int i = 0; i < c.n; ++i)
+            if (c.w[i] > domW)
+            {
+                domW  = c.w[i];
+                c.dom = i;
+            }
+        return c;
+    }
+
+    /// Палитра доминирующего региона колонки (блоки не блендятся).
+    const MaterialPalette& materialsOf(const ColumnWeights& c) const
+    {
+        return c.dom >= 0 ? regions[c.dom].materials : materials;
     }
 
     /// Модуляция геометрии для biome::sample (крючок IRegionModulator).
@@ -248,8 +290,8 @@ struct WorldDef : public biome::IRegionModulator
     {
         if (regions.empty())
             return;
-        float w[16];
-        const size_t n    = std::min(regions.size(), size_t(16));
+        float w[kMaxRegions];
+        const size_t n    = std::min(regions.size(), kMaxRegions);
         const float baseW = regionWeights(wx, wz, w);
         float cs = baseW, ss = baseW, ca = 0.0f, sa = 0.0f;  // база: scale=1, add=0
         for (size_t i = 0; i < n; ++i)
@@ -264,12 +306,16 @@ struct WorldDef : public biome::IRegionModulator
     }
 
     /// Сблендированный профиль рельефа в точке (база + регионы по весам).
+    /// ⚠️ Диагностика/UI: числовые поля смешаны, а частоты/октавы/пороги взяты у
+    /// доминирующего региона — по такому профилю НЕЛЬЗЯ считать высоту (на границе
+    /// доминирования получится обрыв). Генератор считает высоту по каждому региону
+    /// отдельно и смешивает уже ВЫСОТЫ (worldgen::columnHeight).
     TerrainProfile sampleTerrain(double wx, double wz) const
     {
         if (regions.empty())
             return terrain;
-        float w[16];
-        const size_t n    = std::min(regions.size(), size_t(16));
+        float w[kMaxRegions];
+        const size_t n    = std::min(regions.size(), kMaxRegions);
         const float baseW = regionWeights(wx, wz, w);
         TerrainProfile t  = terrain;
         // Числовые поля — взвешенная сумма база*baseW + Σ w_i·region_i.
@@ -322,18 +368,7 @@ struct WorldDef : public biome::IRegionModulator
     {
         if (regions.empty())
             return materials;
-        float w[16];
-        const size_t n    = std::min(regions.size(), size_t(16));
-        const float baseW = regionWeights(wx, wz, w);
-        int dom = -1;
-        float domW = baseW;
-        for (size_t i = 0; i < n; ++i)
-            if (w[i] > domW)
-            {
-                domW = w[i];
-                dom  = static_cast<int>(i);
-            }
-        return dom >= 0 ? regions[dom].materials : materials;
+        return materialsOf(sampleColumn(wx, wz));
     }
 
     /// Погода в точке (ЗАГОТОВКА): тип — от доминирующего региона,
@@ -343,8 +378,8 @@ struct WorldDef : public biome::IRegionModulator
         WeatherZone out = weather;
         if (regions.empty())
             return out;
-        float w[16];
-        const size_t n    = std::min(regions.size(), size_t(16));
+        float w[kMaxRegions];
+        const size_t n    = std::min(regions.size(), kMaxRegions);
         const float baseW = regionWeights(wx, wz, w);
         float temp = baseW * weather.temperature, hum = baseW * weather.humidity;
         int dom = -1;
@@ -374,8 +409,18 @@ struct WorldDef : public biome::IRegionModulator
 namespace detail
 {
 
+/// Предупреждения парсинга (опечатки, значения вне диапазона). Собираются на время
+/// loadFromString (thread_local) и доступны через WorldCatalog::warnings().
+inline std::vector<std::string>& warnings()
+{
+    static thread_local std::vector<std::string> w;
+    return w;
+}
+inline void warn(std::string msg) { warnings().push_back(std::move(msg)); }
+
 inline BlockId blockFromName(const std::string& s, BlockId fallback = BLOCK_STONE)
 {
+    if (s.empty())          return fallback;  // поле не задано — молча дефолт
     if (s == "air")         return BLOCK_AIR;
     if (s == "grass")       return BLOCK_GRASS;
     if (s == "stone")       return BLOCK_STONE;
@@ -388,6 +433,7 @@ inline BlockId blockFromName(const std::string& s, BlockId fallback = BLOCK_STON
     if (s == "gold_ore")    return BLOCK_GOLD_ORE;
     if (s == "crystal_ore") return BLOCK_CRYSTAL_ORE;
     if (s == "snow")        return BLOCK_SNOW;
+    warn("неизвестный блок '" + s + "' — использован дефолт");
     return fallback;
 }
 
@@ -397,6 +443,8 @@ inline WeatherType weatherFromName(const std::string& s)
         return WeatherType::Rain;
     if (s == "snow")
         return WeatherType::Snow;
+    if (!s.empty() && s != "clear")
+        warn("неизвестная погода '" + s + "' — использована 'clear'");
     return WeatherType::Clear;
 }
 
@@ -404,9 +452,41 @@ inline float getF(const rapidjson::Value& o, const char* k, float def)
 {
     return (o.IsObject() && o.HasMember(k) && o[k].IsNumber()) ? o[k].GetFloat() : def;
 }
+/// Целое из JSON-числа. Дробное усекается, выход за диапазон int — клампится
+/// (rapidjson::GetInt на дробном/большом числе — assert/UB).
 inline int getI(const rapidjson::Value& o, const char* k, int def)
 {
-    return (o.IsObject() && o.HasMember(k) && o[k].IsNumber()) ? o[k].GetInt() : def;
+    if (!(o.IsObject() && o.HasMember(k) && o[k].IsNumber()))
+        return def;
+    const double d = o[k].GetDouble();
+    if (!std::isfinite(d))
+        return def;
+    return static_cast<int>(std::clamp(d, static_cast<double>(INT_MIN), static_cast<double>(INT_MAX)));
+}
+/// getI + кламп в [lo, hi] с предупреждением, если значение пришлось поправить.
+inline int getIClamped(const rapidjson::Value& o, const char* k, int def, int lo, int hi)
+{
+    const int v = getI(o, k, def);
+    const int c = std::clamp(v, lo, hi);
+    if (c != v)
+        warn(std::string("'") + k + "'=" + std::to_string(v) + " вне [" + std::to_string(lo) + ", " +
+             std::to_string(hi) + "] — исправлено на " + std::to_string(c));
+    return c;
+}
+/// uint32-сид: любое целое (в т.ч. > INT_MAX и отрицательное) берётся по модулю 2^32.
+inline uint32_t getSeed(const rapidjson::Value& o, const char* k, uint32_t def)
+{
+    if (!(o.IsObject() && o.HasMember(k) && o[k].IsNumber()))
+        return def;
+    const auto& v = o[k];
+    if (v.IsUint64())
+        return static_cast<uint32_t>(v.GetUint64());
+    if (v.IsInt64())
+        return static_cast<uint32_t>(v.GetInt64());
+    const double d = v.GetDouble();
+    if (!std::isfinite(d))
+        return def;
+    return static_cast<uint32_t>(static_cast<int64_t>(d));
 }
 inline bool getB(const rapidjson::Value& o, const char* k, bool def)
 {
@@ -443,11 +523,11 @@ inline void parseTerrain(const rapidjson::Value& o, TerrainProfile& t)
     t.baseHeight   = getF(o, "baseHeight", t.baseHeight);
     t.amplitude    = getF(o, "amplitude", t.amplitude);
     t.terrainFreq  = getF(o, "terrainFreq", t.terrainFreq);
-    t.octaves      = getI(o, "octaves", t.octaves);
+    t.octaves      = getIClamped(o, "octaves", t.octaves, 1, 8);
     t.macroOffset  = getF(o, "macroOffset", t.macroOffset);
     t.macroShift   = getF(o, "macroShift", t.macroShift);
     t.macroFreq    = getF(o, "macroFreq", t.macroFreq);
-    t.macroOctaves = getI(o, "macroOctaves", t.macroOctaves);
+    t.macroOctaves = getIClamped(o, "macroOctaves", t.macroOctaves, 1, 8);
     if (o.HasMember("hills"))
         parseHills(o["hills"], t.hills);
     if (o.HasMember("lakes"))
@@ -465,7 +545,7 @@ inline void parseMaterials(const rapidjson::Value& o, MaterialPalette& m)
     m.surfaceGravel     = blockFromName(getS(o, "surfaceGravel", ""), m.surfaceGravel);
     m.surfaceCrust      = blockFromName(getS(o, "surfaceCrust", ""), m.surfaceCrust);
     m.subSurface        = blockFromName(getS(o, "subSurface", ""), m.subSurface);
-    m.subDepth          = getI(o, "subDepth", m.subDepth);
+    m.subDepth          = getIClamped(o, "subDepth", m.subDepth, 0, 64);
     m.rockThreshold     = getF(o, "rockThreshold", m.rockThreshold);
     m.rockFreq          = getF(o, "rockFreq", m.rockFreq);
     m.dirtThreshold     = getF(o, "dirtThreshold", m.dirtThreshold);
@@ -484,7 +564,7 @@ inline void parseMaterials(const rapidjson::Value& o, MaterialPalette& m)
             r.maxY      = getI(jo, "maxY", r.maxY);
             r.threshold = getF(jo, "threshold", r.threshold);
             r.freq      = getF(jo, "freq", r.freq);
-            r.octaves   = getI(jo, "octaves", r.octaves);
+            r.octaves   = getIClamped(jo, "octaves", r.octaves, 1, 8);
             r.enabled   = getB(jo, "enabled", r.enabled);
             m.ores.push_back(r);
         }
@@ -517,6 +597,12 @@ inline void parseBiomes(const rapidjson::Value& o, biome::BiomeConfig& b)
     b.enabled       = getB(o, "enabled", b.enabled);
     b.macroCellSize = getF(o, "macroCellSize", b.macroCellSize);
     b.blendWidth    = getF(o, "blendWidth", b.blendWidth);
+    if (!(b.macroCellSize >= 8.0f))  // 0/отрицательный размер ячейки → деление на 0 в biome::sample
+    {
+        warn("geometry.macroCellSize < 8 — исправлено на 8");
+        b.macroCellSize = 8.0f;
+    }
+    b.blendWidth = std::max(b.blendWidth, 0.0f);
     const std::string forced = getS(o, "forced", "");
     if (forced == "classic")
         b.forced = biome::BiomeType::Classic;
@@ -527,9 +613,9 @@ inline void parseBiomes(const rapidjson::Value& o, biome::BiomeConfig& b)
     if (o.HasMember("frequency") && o["frequency"].IsObject())
     {
         const auto& f = o["frequency"];
-        b.frequency[static_cast<int>(biome::BiomeType::Classic)] = getF(f, "classic", 0.0f);
-        b.frequency[static_cast<int>(biome::BiomeType::Voronoi)] = getF(f, "voronoi", 0.0f);
-        b.frequency[static_cast<int>(biome::BiomeType::Jelly)]   = getF(f, "jelly", 0.0f);
+        b.frequency[static_cast<int>(biome::BiomeType::Classic)] = getF(f, "classic", b.frequency[static_cast<int>(biome::BiomeType::Classic)]);
+        b.frequency[static_cast<int>(biome::BiomeType::Voronoi)] = getF(f, "voronoi", b.frequency[static_cast<int>(biome::BiomeType::Voronoi)]);
+        b.frequency[static_cast<int>(biome::BiomeType::Jelly)]   = getF(f, "jelly", b.frequency[static_cast<int>(biome::BiomeType::Jelly)]);
     }
 }
 
@@ -538,7 +624,7 @@ inline WorldDef parseWorld(const rapidjson::Value& o)
     WorldDef w;
     w.id   = getS(o, "id", "world");
     w.name = getS(o, "name", w.id);
-    w.seed = static_cast<uint32_t>(getI(o, "seed", 1337));
+    w.seed = getSeed(o, "seed", 1337u);
     w.biomes.seed = w.seed;  // сид биомов/джиттера привязан к сиду мира
     if (o.HasMember("spawn") && o["spawn"].IsObject())
     {
@@ -550,7 +636,8 @@ inline WorldDef parseWorld(const rapidjson::Value& o)
     if (o.HasMember("water") && o["water"].IsObject())
     {
         w.waterEnabled = getB(o["water"], "enabled", w.waterEnabled);
-        w.seaLevel     = getI(o["water"], "seaLevel", w.seaLevel);
+        // seaLevel — индекс слоя воды: должен лежать внутри чанка (иначе запись за границы).
+        w.seaLevel     = getIClamped(o["water"], "seaLevel", w.seaLevel, 1, CHUNK_SIZE_Y - 2);
     }
     if (o.HasMember("terrain"))
         parseTerrain(o["terrain"], w.terrain);
@@ -563,6 +650,11 @@ inline WorldDef parseWorld(const rapidjson::Value& o)
     {
         for (const auto& jr : o["regions"].GetArray())
         {
+            if (w.regions.size() >= kMaxRegions)
+            {
+                warn("мир '" + w.id + "': регионов больше " + std::to_string(kMaxRegions) + " — лишние отброшены");
+                break;
+            }
             Region r;
             // Регион стартует с копии базовых настроек мира — переопределяются
             // только явно заданные поля.
@@ -572,6 +664,12 @@ inline WorldDef parseWorld(const rapidjson::Value& o)
 
             r.name  = getS(jr, "name", "region");
             r.blend = getF(jr, "blend", r.blend);
+            if (!(r.blend >= kMinBlend))
+            {
+                warn("регион '" + r.name + "': blend < " + std::to_string(static_cast<int>(kMinBlend)) +
+                     " — исправлено на минимум");
+                r.blend = kMinBlend;
+            }
             if (jr.HasMember("ring") && jr["ring"].IsObject())
             {
                 r.useRing = true;
@@ -610,26 +708,49 @@ inline WorldDef parseWorld(const rapidjson::Value& o)
 class WorldCatalog
 {
 public:
-    /// Загрузка из JSON-строки. @return false при ошибке парсинга (каталог пуст).
+    /// Загрузка из JSON-строки. @return false при ошибке парсинга или пустом списке
+    /// миров (каталог при этом пуст). Нефатальные проблемы конфига (опечатки в
+    /// именах блоков, значения вне диапазона, лишние регионы) попадают в warnings().
     bool loadFromString(const std::string& json)
     {
+        _worlds.clear();
+        _activeId.clear();
+        detail::warnings().clear();
+
         rapidjson::Document doc;
         doc.Parse(json.c_str());
         if (doc.HasParseError() || !doc.IsObject())
+        {
+            _warnings = {"worlds.json: ошибка разбора JSON"};
             return false;
-        _worlds.clear();
+        }
         if (doc.HasMember("worlds") && doc["worlds"].IsArray())
             for (const auto& jw : doc["worlds"].GetArray())
             {
-                auto w    = std::make_unique<WorldDef>(detail::parseWorld(jw));
+                auto w = std::make_unique<WorldDef>(detail::parseWorld(jw));
+                if (byId(w->id))
+                    detail::warn("повторный id мира '" + w->id + "' — byId вернёт первый");
                 // Крючок региональной модуляции геометрии: все biome::sample мира
                 // автоматически учитывают его регионы.
                 w->biomes.regionModulator = w.get();
                 _worlds.push_back(std::move(w));
             }
-        _activeId = detail::getS(doc, "activeWorld", _worlds.empty() ? "" : _worlds.front()->id);
+
+        // activeWorld: если id не найден (опечатка) — берём первый мир, а не аварийный.
+        _activeId = detail::getS(doc, "activeWorld", "");
+        if (!_worlds.empty() && !byId(_activeId))
+        {
+            if (!_activeId.empty())
+                detail::warn("activeWorld '" + _activeId + "' не найден — взят первый мир '" +
+                             _worlds.front()->id + "'");
+            _activeId = _worlds.front()->id;
+        }
+        _warnings = detail::warnings();
         return !_worlds.empty();
     }
+
+    /// Предупреждения последней загрузки (для лога). Пусто — конфиг чистый.
+    const std::vector<std::string>& warnings() const { return _warnings; }
 
     const WorldDef* byId(const std::string& id) const
     {
@@ -655,6 +776,7 @@ public:
 private:
     std::vector<std::unique_ptr<WorldDef>> _worlds;
     std::string _activeId;
+    std::vector<std::string> _warnings;
 };
 
 }  // namespace worldcfg
